@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>付费特效测试</title>
+    <style>
+        body { background: #1a1a2e; color: #fff; font-family: system-ui; padding: 20px; }
+        .panel { background: #16213e; padding: 20px; border-radius: 8px; width: 300px; }
+        .effect-btn {
+            display: block; width: 100%; padding: 10px; margin-bottom: 10px;
+            background: #0f3460; color: white; border: none; border-radius: 4px; cursor: pointer;
+        }
+        .effect-btn:hover { background: #e94560; }
+        .effect-btn.premium { border: 1px solid #e94560; }
+        .effect-btn.premium::after { content: " 👑 VIP"; font-size: 12px; color: #e94560; }
+        .status { margin-top: 10px; font-size: 14px; color: #aaa; }
+        .modal {
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.8); justify-content: center; align-items: center;
+        }
+        .modal-content {
+            background: #16213e; padding: 30px; border-radius: 8px; text-align: center;
+        }
+        .modal button { padding: 10px 20px; background: #e94560; border: none; color: white; border-radius: 4px; cursor: pointer;}
+    </style>
+</head>
+<body>
+
+    <!-- 模拟用户当前状态 -->
+    <div class="panel">
+        <h3>当前用户状态：<span id="user-plan-text">免费版</span></h3>
+        <p>套餐限制：最大时间线 <span id="limit-timelines">1</span> 条，导出分辨率 <span id="limit-resolution">720P</span></p >
+        <button class="effect-btn" onclick="switchPlan('free')">切换到免费版</button>
+        <button class="effect-btn" onclick="switchPlan('pro')">切换到专业版</button>
+
+        <hr style="border-color: #0f3460; margin: 20px 0;">
+
+        <h3>特效列表</h3>
+        <div id="effects-list">
+            <!-- 特效按钮由 JS 动态生成 -->
+        </div>
+
+        <div class="status" id="status-log">准备就绪</div>
+    </div>
+
+    <!-- 付费墙弹窗 -->
+    <div class="modal" id="paywall-modal">
+        <div class="modal-content">
+            <h2>升级到专业版</h2>
+            <p>此特效为专业版专属功能</p >
+            <p style="color: #aaa; font-size: 14px;">解锁全部高级特效、4K导出、无水印</p >
+            <button onclick="closeModal()">取消</button>
+            <button style="background: #0f3460; margin-left: 10px;" onclick="switchPlan('pro'); closeModal();">立即升级</button>
+        </div>
+    </div>
+
+    <!-- 引入配置文件 -->
+    <script src="entitlements-config.js"></script>
+
+    <script>
+        // 当前用户状态（模拟，以后接后端接口）
+        let currentUserPlan = 'free';
+
+        // UI 渲染层：根据权限渲染特效列表
+        function renderEffects() {
+            const container = document.getElementById('effects-list');
+            container.innerHTML = '';
+
+            // 遍历 EFFECTS 对象
+            for (const key in window.EFFECTS) {
+                const effect = window.EFFECTS[key];
+                const btn = document.createElement('button');
+                btn.className = 'effect-btn' + (effect.isPremium ? ' premium' : '');
+                btn.textContent = effect.name;
+
+                // 点击事件
+                btn.onclick = () => handleEffectClick(effect);
+                container.appendChild(btn);
+            }
+        }
+
+        // 事件处理层：门控逻辑
+        function handleEffectClick(effect) {
+            // 0. 未上线特效：任何档位都不可用，提示敬请期待而非付费墙
+            if (effect.shipped === false) {
+                document.getElementById('status-log').textContent = `⏳ 敬请期待: ${effect.name}（开发中）`;
+                return;
+            }
+            // 1. 调用配置文件的 helper 函数检查权限
+            const hasPermission = window.hasEffectPermission(currentUserPlan, effect.id);
+
+            if (hasPermission) {
+                // 2. 有权限，执行应用特效逻辑
+                document.getElementById('status-log').textContent = `✅ 应用特效: ${effect.name}`;
+                console.log(`应用特效: ${effect.name}`);
+            } else {
+                // 3. 无权限，弹出付费墙
+                document.getElementById('status-log').textContent = `❌ 权限不足: ${effect.name}`;
+                showPaywallModal();
+            }
+        }
+
+        // 切换套餐（模拟）
+        function switchPlan(plan) {
+            currentUserPlan = plan;
+            document.getElementById('user-plan-text').textContent = window.PLANS[plan].name;
+
+            // 更新限制显示
+            document.getElementById('limit-timelines').textContent = window.getPlanLimit(plan, 'maxTimelines');
+            document.getElementById('limit-resolution').textContent = window.getPlanLimit(plan, 'exportResolution') + 'P';
+
+            renderEffects();
+            document.getElementById('status-log').textContent = `已切换到: ${window.PLANS[plan].name}`;
+        }
+
+        // 弹窗控制
+        function showPaywallModal() {
+            document.getElementById('paywall-modal').style.display = 'flex';
+        }
+        function closeModal() {
+            document.getElementById('paywall-modal').style.display = 'none';
+        }
+
+        // 初始化
+        renderEffects();
+    </script>
+</body>
+</html>

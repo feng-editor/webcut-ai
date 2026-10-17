@@ -1,0 +1,19 @@
+# Docker 构建排除
+.git
+.gitignore
+node_modules
+__pycache__
+*.pyc
+.env
+ai-backend/.env
+ai-backend/cloud/
+ai-backend/data/
+ai-backend/tmp/
+ai-backend/tmp/*
+*.mp4
+test.mp4
+test2.mp4
+paywall-test.html
+_served.html
+_cur.html
+probe_tts.py

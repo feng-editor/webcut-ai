@@ -1,0 +1,42 @@
+# ============================================================
+# WebCut 后端 docker-compose.yml
+# 使用：docker-compose up -d
+# 停止：docker-compose down
+# 查看日志：docker-compose logs -f
+#
+# 环境变量：把 ai-backend/.env 复制到服务器同目录（自动挂载），
+# 或在下方 environment 段直接填入。
+# ============================================================
+version: '3.8'
+
+services:
+  webcut:
+    build: .
+    container_name: webcut-backend
+    ports:
+      - "8787:8787"
+    volumes:
+      # .env 配置文件（Key 在这里）
+      - ./ai-backend/.env:/app/ai-backend/.env:ro
+      # 持久化数据（云同步/支付记录/临时文件）
+      - backend-data:/app/ai-backend/data
+      - backend-cloud:/app/ai-backend/cloud
+      - backend-tmp:/app/ai-backend/tmp
+    environment:
+      - TZ=Asia/Shanghai
+      # 也可以直接在这里填 Key（优先级：环境变量 > .env 文件）
+      # - DASHSCOPE_API_KEY=sk-xxx
+      # - ALIPAY_APP_ID=xxx
+      # - ALIPAY_PRIVATE_KEY=xxx
+      # - ALIPAY_PUBLIC_KEY=xxx
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/ai/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  backend-data:
+  backend-cloud:
+  backend-tmp:

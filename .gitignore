@@ -1,0 +1,14 @@
+# 密钥与本地产物
+ai-backend/.env
+ai-backend/tmp/
+ai-backend/cloud/
+ai-backend/data/
+*.mp4
+test.mp4
+test2.mp4
+_served.html
+_cur.html
+probe_tts.py
+__pycache__/
+*.pyc
+node_modules/
