@@ -82,11 +82,10 @@ def cfg(name, default=''):
 KEY = cfg('DASHSCOPE_API_KEY')
 
 # DashScope API 基础地址：
-#   公共 Key（sk-xxx）→ https://dashscope.aliyuncs.com
-#   专属业务空间 Key（sk-ws-xxx）→ https://{workspace-id}.{region}.maas.aliyuncs.com
-# 在 .env 中配置 DASHSCOPE_BASE_URL 即可切换，默认为专属业务空间
-DASHSCOPE_BASE = cfg('DASHSCOPE_BASE_URL',
-    'https://ws-gsfzbytoiuvqh8rj.cn-beijing.maas.aliyuncs.com')
+#   默认业务空间 Key（sk-ws-xxx 在默认空间生成）→ https://dashscope.aliyuncs.com
+#   专属业务空间 Key → https://{workspace-id}.{region}.maas.aliyuncs.com
+# 在 .env 中配置 DASHSCOPE_BASE_URL 可覆盖
+DASHSCOPE_BASE = cfg('DASHSCOPE_BASE_URL', 'https://dashscope.aliyuncs.com')
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))  # ai-backend 的上一级就是 video-editor
 TMP = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'tmp')
 os.makedirs(TMP, exist_ok=True)
