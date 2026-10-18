@@ -133,11 +133,12 @@ def create_wanx_task(prompt, duration):
         'model': WANX_MODEL,
         'input': {'prompt': prompt},
         'parameters': {'size': '960*960', 'duration': duration or 4}
-    }).encode('utf-8')
+    }, ensure_ascii=False).encode('utf-8')
     code, raw = fetch_with_retry(
         DASHSCOPE_BASE + '/api/v1/services/aigc/video-generation/video-synthesis',
         data=payload,
-        headers={'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json',
+        headers={'Authorization': 'Bearer ' + KEY,
+                 'Content-Type': 'application/json; charset=utf-8',
                  'X-DashScope-Async': 'enable'})
     j = read_json(raw)
     task_id = (j.get('output') or {}).get('task_id')
@@ -179,11 +180,12 @@ def create_cosyvoice_speech(text, voice):
     payload = json.dumps({
         'model': 'cosyvoice-v2',
         'input': {'text': text[:2000], 'voice': voice or 'longxiaochun_v2', 'format': 'mp3'}
-    }).encode('utf-8')
+    }, ensure_ascii=False).encode('utf-8')
     code, raw = fetch_with_retry(
         DASHSCOPE_BASE + '/api/v1/services/audio/tts/SpeechSynthesizer',
         data=payload,
-        headers={'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json'})
+        headers={'Authorization': 'Bearer ' + KEY,
+                 'Content-Type': 'application/json; charset=utf-8'})
     j = read_json(raw)
     if j.get('code'):
         raise RuntimeError(str(j.get('code')) + ' ' + str(j.get('message', ''))[:160])  # 鉴权失败等
