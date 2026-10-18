@@ -695,6 +695,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {'error': str(e)})
 
     def api(self, method, parts):
+        print('[api] %s /%s' % (method, '/'.join(parts)))
+        try:
+            return self._api_inner(method, parts)
+        except Exception as e:
+            import traceback
+            print('[api] 崩溃: %s\n%s' % (e, traceback.format_exc()))
+            try:
+                return self._json(500, {'error': '服务器内部错误: ' + str(e)})
+            except Exception:
+                pass
+
+    def _api_inner(self, method, parts):
         # ================= 支付与权益 =================
         # POST /api/orders {plan,cycle}（Header X-User-Token：浏览器身份）
         if parts[1] == 'orders' and method == 'POST' and len(parts) == 2:
@@ -796,25 +808,37 @@ class Handler(BaseHTTPRequestHandler):
 
         # POST /api/ai/video {prompt, duration}
         if method == 'POST' and parts[2] == 'video' and len(parts) == 3:
-            body = self._body()
-            prompt = (body.get('prompt') or '').strip()
-            if not prompt:
-                return self._json(400, {'error': 'prompt 不能为空'})
-            if not KEY:
-                return self._json(501, {'error': '未配置 DASHSCOPE_API_KEY'})
-            task_id = str(uuid.uuid4())
-            TASKS[task_id] = {'id': task_id, 'status': 'running', 'progress': 0.1,
-                              'stage': '排队中', 'prompt': prompt, 'error': None, 'video_file': None}
+            print('[ai/video] 收到创建任务请求')
+            try:
+                body = self._body()
+                prompt = (body.get('prompt') or '').strip()
+                if not prompt:
+                    return self._json(400, {'error': 'prompt 不能为空'})
+                if not KEY:
+                    return self._json(501, {'error': '未配置 DASHSCOPE_API_KEY'})
+                print('[ai/video] prompt=%s, duration=%s' % (prompt[:50], body.get('duration')))
+                task_id = str(uuid.uuid4())
+                TASKS[task_id] = {'id': task_id, 'status': 'running', 'progress': 0.1,
+                                  'stage': '排队中', 'prompt': prompt, 'error': None, 'video_file': None}
 
-            def start():
-                try:
-                    tid = create_wanx_task(prompt, body.get('duration'))
-                    poll_loop(task_id, tid)
-                except Exception as e:
-                    TASKS[task_id]['status'] = 'failed'
-                    TASKS[task_id]['error'] = str(e)
-            threading.Thread(target=start, daemon=True).start()
-            return self._json(200, {'taskId': task_id})
+                def start():
+                    try:
+                        print('[ai/video] 开始调用万相 API...')
+                        tid = create_wanx_task(prompt, body.get('duration'))
+                        print('[ai/video] 万相任务已创建: %s' % tid)
+                        poll_loop(task_id, tid)
+                    except Exception as e:
+                        import traceback
+                        print('[ai/video] 生成失败: %s\n%s' % (e, traceback.format_exc()))
+                        TASKS[task_id]['status'] = 'failed'
+                        TASKS[task_id]['error'] = str(e)
+                threading.Thread(target=start, daemon=True).start()
+                print('[ai/video] 任务已分配: %s' % task_id)
+                return self._json(200, {'taskId': task_id})
+            except Exception as e:
+                import traceback
+                print('[ai/video] 路由崩溃: %s\n%s' % (e, traceback.format_exc()))
+                return self._json(500, {'error': '服务器内部错误: ' + str(e)})
 
         # GET /api/ai/video/:id
         if method == 'GET' and parts[2] == 'video' and len(parts) == 4:
@@ -848,7 +872,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {'error': 'not found'})
 
     def log_message(self, fmt, *args):
-        pass  # 静默访问日志
+        """访问日志：打印每个请求（之前被禁用导致看不到请求到达）"""
+        print('[http] %s %s' % (self.command, self.path))
 
 
 if __name__ == '__main__':
