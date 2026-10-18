@@ -1,0 +1,21 @@
+# Netlify 部署配置
+# 反向代理：前端 HTTPS → Netlify Rewrite → 云服务器 HTTP
+# 解决 Mixed Content 问题（HTTPS 页面不能直接请求 HTTP 接口）
+
+[[redirects]]
+  from = "/api/*"
+  to = "http://116.62.153.186:8787/api/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/ai-media/*"
+  to = "http://116.62.153.186:8787/ai-media/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/pay/*"
+  to = "http://116.62.153.186:8787/pay/:splat"
+  status = 200
+  force = true
