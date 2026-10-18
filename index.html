@@ -1853,18 +1853,25 @@ var AIClient=(function(){
     },cancelToken).then(function(file){onStage('封装完成',0.8);return file;});
   }
   function generate(prompt,sec,onStage,cancelToken){
-    return health().then(function(c){
-      if(c&&c.video){
+    // 强制走后端 API，彻底移除本地演示降级
+    onStage('正在连接 AI 服务器…',0.01);
+    return fetch(API_BASE + '/api/ai/health',{signal:AbortSignal.timeout(15000)})
+      .then(function(r){return r.json();})
+      .then(function(h){
+        if(!h.available){
+          throw new Error('AI 服务不可用，请稍后重试');
+        }
+        if(!h.video){
+          throw new Error('后端未配置有效的 DASHSCOPE_API_KEY（video=false）。请检查服务器 .env 文件。');
+        }
         return backendFlow(prompt,sec,onStage);
-      }
-      if(c&&!c.video){
-        // 后端在位但 video=false（Key 未配置或无效），显示明确错误而非静默降级
-        return Promise.reject(new Error('后端未配置有效的 DASHSCOPE_API_KEY，无法使用 AI 生成。请检查服务器 .env 配置。'));
-      }
-      // 后端完全不可达（网络断开），降级本地演示
-      console.warn('[WebCut] 后端不可达，降级本地演示生成');
-      return mockFlow(prompt,sec,onStage,cancelToken);
-    });
+      })
+      .catch(function(e){
+        if(e&&e.message&&e.message.indexOf('AI 服务')>=0)throw e;
+        if(e&&e.message&&e.message.indexOf('DASHSCOPE')>=0)throw e;
+        // 网络/代理层错误（Netlify 代理不可达、服务器宕机等）
+        throw new Error('无法连接 AI 服务器（'+((e&&e.message)||'网络错误')+'）。请检查网络或稍后重试。');
+      });
   }
   return {generate:generate,health:health};
 })();
@@ -4012,8 +4019,8 @@ function aiHideError(){
 function openAIModal(){
   AIClient.health().then(function(caps){
     var chip=caps
-      ?(caps.video?'链路：后端 API（通义万相生成 + CosyVoice 旁白）':'链路：混合（本地生成 + 后端 TTS 演示音）')
-      :'链路：本地演示（浏览器内编码生成 + 合成配乐）';
+      ?(caps.video?'链路：云端 AI（通义万相 + CosyVoice）':'链路：后端 TTS 可用（视频生成需配置 Key）')
+      :'链路：云端 AI（通过代理连接后端服务器）';
     openModal('AI 生成视频',
       '<div class="ai-box">'
       +'<textarea id="aiPrompt" placeholder="描述你想要的画面，例如：一只猫在太空漂浮，背景是星云…"></textarea>'
