@@ -4074,6 +4074,7 @@ function openAIModal(){
       +'<div class="m-actions"><button class="btn" id="aiClose">关闭</button><button class="btn primary" id="aiGo">'+icon('sparkles',13)+' 开始生成</button></div>'
       +'</div>');
     $id('aiGo').addEventListener('click',function(){
+      console.log('[WebCut AI] 「开始生成」按钮被点击');
       var prompt=$id('aiPrompt').value.trim();
       if(!prompt)return aiShowError('请先输入画面描述');
       if(aiRun&&aiRun.busy)return;
@@ -4089,16 +4090,89 @@ function openAIModal(){
   });
 }
 function runAIgeneration(prompt,sec,caps){
+  console.log('开始执行生成任务');
+  console.log('[WebCut AI] prompt:', prompt, 'duration:', sec, 'caps:', caps);
   aiRun={busy:true,cancelled:false};
   var go=$id('aiGo');
   if(go){go.disabled=true;go.textContent='生成中…';}
   var errBox=$id('aiErr');
   if(errBox)errBox.classList.remove('on');
-  aiStage('提交任务…',0.02);
-  AIClient.generate(prompt,sec,aiStage,aiRun)
-    .then(function(file){
-      return ingestVideoFile(file,('AI·'+prompt).replace(/[\\/:*?"<>|]/g,'').slice(0,14)+'.mp4');
-    })
+  aiStage('正在连接 AI 服务器…',0.01);
+
+  // ========== 直接 POST 到后端，不经过任何中间层 ==========
+  var url='/api/ai/video';
+  console.log('[WebCut AI] POST →', window.location.origin + url);
+
+  fetch(url,{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({prompt:prompt,duration:sec})
+  })
+  .then(function(r){
+    console.log('[WebCut AI] POST 响应:', r.status, r.ok, r.statusText);
+    if(!r.ok){
+      return r.text().then(function(t){
+        console.error('[WebCut AI] POST 失败，响应体:', t.substring(0,300));
+        throw new Error('服务器返回 '+r.status+': '+t.substring(0,150));
+      });
+    }
+    return r.json();
+  })
+  .then(function(j){
+    console.log('[WebCut AI] 任务创建成功:', j.taskId);
+    if(j.error)throw new Error(j.error);
+    // ========== 轮询任务状态 ==========
+    return new Promise(function(resolve,reject){
+      var t0=Date.now();
+      var pollUrl='/api/ai/video/'+j.taskId;
+      var timer=setInterval(function(){
+        fetch(pollUrl)
+        .then(function(r){
+          if(!r.ok)throw new Error('轮询 HTTP '+r.status);
+          return r.json();
+        })
+        .then(function(s){
+          console.log('[WebCut AI] 轮询:', s.status, s.stage, s.progress);
+          if(s.error){clearInterval(timer);return reject(new Error(s.error));}
+          if(s.status==='failed'){clearInterval(timer);return reject(new Error(s.error||'AI 生成失败'));}
+          var el=Math.round((Date.now()-t0)/1000);
+          var elMin=Math.floor(el/60);
+          if(s.stage==='下载中'){
+            aiStage('AI 正在下载视频…',0.75+s.progress*0.2);
+          }else{
+            aiStage('🤖 AI 正在全力生成中…（已等待 '+elMin+' 分 '+(el%60)+' 秒）',0.05+s.progress*0.65);
+          }
+          if(el>600){clearInterval(timer);return reject(new Error('超时（10 分钟）'));}
+          if(s.status==='done'){
+            clearInterval(timer);
+            aiStage('AI 生成完成！正在下载视频…',0.92);
+            console.log('[WebCut AI] 视频下载 URL:', s.url);
+            fetch(s.url)
+              .then(function(r2){
+                if(!r2.ok)throw new Error('视频下载失败 HTTP '+r2.status);
+                return r2.blob();
+              })
+              .then(function(b){
+                console.log('[WebCut AI] 视频下载完成:', Math.round(b.size/1024)+'KB');
+                resolve(new File([b],'ai-gen.mp4',{type:'video/mp4'}));
+              })
+              .catch(function(e){
+                clearInterval(timer);
+                reject(new Error('视频下载失败: '+e.message));
+              });
+          }
+        })
+        .catch(function(e){
+          console.error('[WebCut AI] 轮询错误:', e.message);
+        });
+      },3000);
+    });
+  })
+  // ========== 后续处理（导入 → 音频 → 时间线） ==========
+  .then(function(file){
+    console.log('[WebCut AI] 开始导入视频到时间线');
+    return ingestVideoFile(file,('AI·'+prompt).replace(/[\\/:*?"<>|]/g,'').slice(0,14)+'.mp4');
+  })
     .then(function(r){
       if(!r.meta)throw new Error('生成的视频无法解码（需 H.264 MP4）');
       return ensureAIAudio(r.item,r.meta,prompt,aiStage,aiRun).then(function(aud){r.audio=aud;return r;});
