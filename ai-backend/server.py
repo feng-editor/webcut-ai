@@ -80,6 +80,13 @@ def cfg(name, default=''):
 
 
 KEY = cfg('DASHSCOPE_API_KEY')
+
+# DashScope API 基础地址：
+#   公共 Key（sk-xxx）→ https://dashscope.aliyuncs.com
+#   专属业务空间 Key（sk-ws-xxx）→ https://{workspace-id}.{region}.maas.aliyuncs.com
+# 在 .env 中配置 DASHSCOPE_BASE_URL 即可切换，默认为专属业务空间
+DASHSCOPE_BASE = cfg('DASHSCOPE_BASE_URL',
+    'https://ws-gsfzbytoiuvqh8rj.cn-beijing.maas.aliyuncs.com')
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))  # ai-backend 的上一级就是 video-editor
 TMP = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'tmp')
 os.makedirs(TMP, exist_ok=True)
@@ -129,7 +136,7 @@ def create_wanx_task(prompt, duration):
         'parameters': {'size': '960*960', 'duration': duration or 4}
     }).encode('utf-8')
     code, raw = fetch_with_retry(
-        'https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis',
+        DASHSCOPE_BASE + '/api/v1/services/aigc/video-generation/video-synthesis',
         data=payload,
         headers={'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json',
                  'X-DashScope-Async': 'enable'})
@@ -142,7 +149,7 @@ def create_wanx_task(prompt, duration):
 
 def poll_wanx_task(task_id):
     code, raw = fetch_with_retry(
-        'https://dashscope.aliyuncs.com/api/v1/tasks/' + task_id,
+        DASHSCOPE_BASE + '/api/v1/tasks/' + task_id,
         headers={'Authorization': 'Bearer ' + KEY})
     j = read_json(raw)
     out = j.get('output') or {}
@@ -175,7 +182,7 @@ def create_cosyvoice_speech(text, voice):
         'input': {'text': text[:2000], 'voice': voice or 'longxiaochun_v2', 'format': 'mp3'}
     }).encode('utf-8')
     code, raw = fetch_with_retry(
-        'https://dashscope.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer',
+        DASHSCOPE_BASE + '/api/v1/services/audio/tts/SpeechSynthesizer',
         data=payload,
         headers={'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json'})
     j = read_json(raw)
