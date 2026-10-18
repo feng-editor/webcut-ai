@@ -1816,17 +1816,44 @@ var AIClient=(function(){
   function backendFlow(prompt,sec,onStage){
     var t0=Date.now();
     onStage('AI 正在全力生成中，请耐心等待…',0.03);
-    return fetch(API_BASE + '/api/ai/video',{method:'POST',headers:{'Content-Type':'application/json'},
+    var videoUrl=API_BASE + '/api/ai/video';
+    console.log('[WebCut AI] 创建视频任务 →', videoUrl);
+    return fetch(videoUrl,{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({prompt:prompt,duration:sec}),signal:AbortSignal.timeout(60000)})
-      .then(function(r){return r.json();})
-      .then(function(j){
+      .then(function(r){
+        console.log('[WebCut AI] 创建任务响应:', r.status, r.ok);
+        if(!r.ok){
+          return r.text().then(function(t){
+            throw new Error('创建任务失败 HTTP '+r.status+': '+t.substring(0,150));
+          });
+        }
+        return r.text();
+      })
+      .then(function(text){
+        var j;
+        try{
+          j=JSON.parse(text);
+        }catch(e){
+          console.error('[WebCut AI] 创建任务返回非 JSON:', text.substring(0,200));
+          throw new Error('创建任务返回非 JSON（代理或后端配置有误）');
+        }
         if(j.error)throw new Error(j.error);
+        console.log('[WebCut AI] 任务已创建:', j.taskId);
         return new Promise(function(resolve,reject){
           var tries=0;
           var timer=setInterval(function(){
             fetch(API_BASE + '/api/ai/video/'+j.taskId,{signal:AbortSignal.timeout(15000)})
-            .then(function(r){return r.json();})
+            .then(function(r){
+              if(!r.ok)throw new Error('HTTP '+r.status);
+              return r.text();
+            })
+            .then(function(text){
+              var s;
+              try{s=JSON.parse(text);}catch(e){return;} // 非JSON跳过本次轮询
+              return s;
+            })
             .then(function(s){
+              if(!s)return;
               if(s.error){clearInterval(timer);return reject(new Error(s.error));}
               if(s.status==='failed'){clearInterval(timer);return reject(new Error(s.error||'生成失败'));}
               var el=Math.round((Date.now()-t0)/1000);
@@ -1855,22 +1882,36 @@ var AIClient=(function(){
   function generate(prompt,sec,onStage,cancelToken){
     // 强制走后端 API，彻底移除本地演示降级
     onStage('正在连接 AI 服务器…',0.01);
-    return fetch(API_BASE + '/api/ai/health',{signal:AbortSignal.timeout(15000)})
-      .then(function(r){return r.json();})
-      .then(function(h){
+    var healthUrl=API_BASE + '/api/ai/health';
+    console.log('[WebCut AI] 健康检查 →', healthUrl);
+    return fetch(healthUrl,{signal:AbortSignal.timeout(15000)})
+      .then(function(r){
+        console.log('[WebCut AI] 健康检查响应:', r.status, r.ok);
+        if(!r.ok){
+          throw new Error('AI 服务器返回 HTTP '+r.status+'（'+r.statusText+'）');
+        }
+        return r.text();
+      })
+      .then(function(text){
+        var h;
+        try{
+          h=JSON.parse(text);
+        }catch(e){
+          console.error('[WebCut AI] 健康检查返回非 JSON:', text.substring(0,200));
+          throw new Error('AI 服务器返回了非 JSON 响应（可能代理配置有误）');
+        }
         if(!h.available){
           throw new Error('AI 服务不可用，请稍后重试');
         }
         if(!h.video){
-          throw new Error('后端未配置有效的 DASHSCOPE_API_KEY（video=false）。请检查服务器 .env 文件。');
+          throw new Error('后端 DASHSCOPE_API_KEY 无效或未配置（video=false）。请在服务器 .env 中检查。');
         }
+        console.log('[WebCut AI] 健康检查通过，开始生成视频');
         return backendFlow(prompt,sec,onStage);
       })
       .catch(function(e){
-        if(e&&e.message&&e.message.indexOf('AI 服务')>=0)throw e;
-        if(e&&e.message&&e.message.indexOf('DASHSCOPE')>=0)throw e;
-        // 网络/代理层错误（Netlify 代理不可达、服务器宕机等）
-        throw new Error('无法连接 AI 服务器（'+((e&&e.message)||'网络错误')+'）。请检查网络或稍后重试。');
+        console.error('[WebCut AI] 生成失败:', e.message);
+        throw new Error('AI 生成失败：'+((e&&e.message)||'未知错误'));
       });
   }
   return {generate:generate,health:health};
