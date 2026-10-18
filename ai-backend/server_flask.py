@@ -5,6 +5,14 @@
 # 启动：python server.py（或 docker-compose up）
 # 端口：8787
 # ============================================================
+import sys
+import io
+
+# 强制 stdout/stderr 使用 UTF-8（修复 Docker 容器内 latin-1 编码错误）
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import os
@@ -90,7 +98,10 @@ def create_video_task():
         data = request.get_json(force=True, silent=True) or {}
         prompt = (data.get('prompt') or '').strip()
         duration = data.get('duration') or 4
-        print(f'>>> [AI] prompt={prompt[:50]}, duration={duration} <<<', flush=True)
+        try:
+            print('>>> [AI] prompt=%s, duration=%s <<<' % (repr(prompt[:50]), duration), flush=True)
+        except Exception:
+            print('>>> [AI] prompt=(打印失败), duration=%s <<<' % duration, flush=True)
 
         if not prompt:
             return jsonify({'error': 'prompt 不能为空'}), 400
