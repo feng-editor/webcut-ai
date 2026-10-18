@@ -585,15 +585,41 @@ def cloud_get_media(token, sid, audio):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # CORS：允许 Netlify 前端跨域访问（同源请求不受影响）
+    ALLOWED_ORIGINS = [
+        'https://webcut-ai-2026.netlify.app',
+        'http://webcut-ai-2026.netlify.app',
+        'http://localhost:3000',   # 本地开发服务器
+        'http://localhost:8899',   # 本地静态服务
+    ]
+
+    def _cors_headers(self):
+        """为跨域请求添加 CORS 头"""
+        origin = self.headers.get('Origin', '')
+        if origin and origin in self.ALLOWED_ORIGINS:
+            self.send_header('Access-Control-Allow-Origin', origin)
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers',
+                             'Content-Type, X-User-Token, X-Media-Name, X-Media-Mime')
+            self.send_header('Access-Control-Max-Age', '86400')
+
+    def do_OPTIONS(self):
+        """CORS 预检请求"""
+        self.send_response(204)
+        self._cors_headers()
+        self.end_headers()
+
     def _json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
         self.send_response(code)
+        self._cors_headers()
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.end_headers()
         self.wfile.write(body)
 
     def _bytes(self, code, data, ctype):
         self.send_response(code)
+        self._cors_headers()
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
@@ -639,6 +665,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(404, {'error': 'not found'})
                 ext = os.path.splitext(name)[1]
                 self.send_response(200)
+                self._cors_headers()
                 self.send_header('Content-Type', MIME.get(ext, 'application/octet-stream'))
                 self.end_headers()
                 with open(file, 'rb') as f:
@@ -651,6 +678,7 @@ class Handler(BaseHTTPRequestHandler):
             if not file.startswith(os.path.abspath(ROOT)) or not os.path.isfile(file):
                 return self._json(404, {'error': 'not found'})
             self.send_response(200)
+            self._cors_headers()
             self.send_header('Content-Type', (MIME.get(os.path.splitext(file)[1], 'application/octet-stream')) + '; charset=utf-8')
             self.end_headers()
             with open(file, 'rb') as f:

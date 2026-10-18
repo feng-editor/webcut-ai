@@ -75,7 +75,7 @@ window.WebCutCloud=function(deps){
     });
   }
   function pushStructure(rec){
-    return fetch('/api/cloud/project',{method:'PUT',
+    return fetch(API_BASE + '/api/cloud/project',{method:'PUT',
       headers:Object.assign({'Content-Type':'application/json'},hdrs()),
       body:JSON.stringify(rec),signal:AbortSignal.timeout(20000)})
       .then(function(r){return r.ok;}).catch(function(){return false;});
@@ -135,21 +135,21 @@ window.WebCutCloud=function(deps){
   function status(){
     return available().then(function(ok){
       if(!ok)return null;
-      return fetch('/api/cloud/status',{headers:hdrs(),signal:AbortSignal.timeout(5000)})
+      return fetch(API_BASE + '/api/cloud/status',{headers:hdrs(),signal:AbortSignal.timeout(5000)})
         .then(function(r){return r.json();}).catch(function(){return null;});
     });
   }
   function usage(){
     return available().then(function(ok){
       if(!ok)return null;
-      return fetch('/api/cloud/usage',{headers:hdrs(),signal:AbortSignal.timeout(5000)})
+      return fetch(API_BASE + '/api/cloud/usage',{headers:hdrs(),signal:AbortSignal.timeout(5000)})
         .then(function(r){return r.json();}).catch(function(){return null;});
     });
   }
   function pull(){
     return available().then(function(ok){
       if(!ok)return false;
-      return fetch('/api/cloud/project',{headers:hdrs(),signal:AbortSignal.timeout(15000)})
+      return fetch(API_BASE + '/api/cloud/project',{headers:hdrs(),signal:AbortSignal.timeout(15000)})
         .then(function(r){
           if(!r.ok)throw new Error('云端暂无备份');
           return r.json();
@@ -157,13 +157,13 @@ window.WebCutCloud=function(deps){
         .then(function(rec){
           return ProjectStore.applyRecord(rec,function(sid){
             var meta=(rec.mediaMeta||{})[sid]||{};
-            return fetch('/api/cloud/media/'+sid,{headers:hdrs(),signal:AbortSignal.timeout(600000)})
+            return fetch(API_BASE + '/api/cloud/media/'+sid,{headers:hdrs(),signal:AbortSignal.timeout(600000)})
               .then(function(r){return r.ok?r.blob():null;})
               .then(function(blob){
                 if(!blob)return null;
                 var m={blob:blob,name:meta.name,mime:meta.mime};
                 if(meta.audio){ // 视频源的 AI 附加音轨
-                  return fetch('/api/cloud/media/'+sid+'/audio',{headers:hdrs(),signal:AbortSignal.timeout(120000)})
+                  return fetch(API_BASE + '/api/cloud/media/'+sid+'/audio',{headers:hdrs(),signal:AbortSignal.timeout(120000)})
                     .then(function(r2){return r2.ok?r2.blob():null;})
                     .then(function(wav){if(wav)m.audioWav=wav;return m;});
                 }

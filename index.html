@@ -706,6 +706,22 @@ body.lib-dragging,body.lib-dragging *{cursor:grabbing!important;user-select:none
 </div>
 <input type="file" id="fileInput" multiple accept="video/*,audio/*,image/*" style="display:none">
 <!-- 权益配置：唯一事实源为 entitlements-config.js（经典脚本，file:// 亦可加载；缺失时编辑器降级为全量可用） -->
+<script>
+/* ============================================================
+   API 地址配置 —— 自动检测部署环境
+   本地/服务器直访（端口 8787）→ 相对路径（同源请求，无 CORS）
+   Netlify/Vercel 等静态托管 → 指向云服务器后端（跨域，需后端 CORS）
+   ============================================================ */
+var API_BASE = (function(){
+  var host = window.location.hostname;
+  var port = window.location.port;
+  // 如果不是从后端服务器访问（如 Netlify/Vercel），指向云服务器
+  if (port !== '8787' && host !== '116.62.153.186') {
+    return 'http://116.62.153.186:8787';
+  }
+  return ''; // 同源，用相对路径
+})();
+</script>
 <script src="entitlements-config.js"></script>
 <!-- 云同步模块（WebCutCloud 工厂；file:// 兼容的经典脚本） -->
 <script src="js/cloud-sync.js"></script>
@@ -1798,7 +1814,7 @@ var AIClient=(function(){
   var caps=null; // null=未探测；{video:文生视频需Key, tts:语音合成(有Key走CosyVoice/无Key本地演示), provider}
   function health(){
     if(caps!=null)return Promise.resolve(caps);
-    return fetch('/api/ai/health',{signal:AbortSignal.timeout(4000)}) // 4s：容纳 Serverless 冷启动
+    return fetch(API_BASE + '/api/ai/health',{signal:AbortSignal.timeout(4000)}) // 4s：容纳 Serverless 冷启动
       .then(function(r){return r.json();})
       .then(function(j){caps=(j&&j.available)?{video:!!j.video,tts:!!j.tts,provider:j.provider||''}:null;})
       .catch(function(){caps=null;})
@@ -1807,7 +1823,7 @@ var AIClient=(function(){
   function backendFlow(prompt,sec,onStage){
     var t0=Date.now();
     onStage('提交任务…',0.03);
-    return fetch('/api/ai/video',{method:'POST',headers:{'Content-Type':'application/json'},
+    return fetch(API_BASE + '/api/ai/video',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({prompt:prompt,duration:sec}),signal:AbortSignal.timeout(30000)})
       .then(function(r){return r.json();})
       .then(function(j){
@@ -1815,7 +1831,7 @@ var AIClient=(function(){
         return new Promise(function(resolve,reject){
           var tries=0;
           var timer=setInterval(function(){
-            fetch('/api/ai/video/'+j.taskId,{signal:AbortSignal.timeout(10000)})
+            fetch(API_BASE + '/api/ai/video/'+j.taskId,{signal:AbortSignal.timeout(10000)})
             .then(function(r){return r.json();})
             .then(function(s){
               if(s.error){clearInterval(timer);return reject(new Error(s.error));}
@@ -1881,26 +1897,26 @@ var PayClient=(function(){
     if(online!=null)return Promise.resolve(online);
     return AIClient.health().then(function(caps){
       if(!caps)return false; // 无后端 → 离线模式
-      return fetch('/api/me/entitlements',{headers:{'X-User-Token':token()},signal:AbortSignal.timeout(4000)})
+      return fetch(API_BASE + '/api/me/entitlements',{headers:{'X-User-Token':token()},signal:AbortSignal.timeout(4000)})
         .then(function(r){return r.json();})
         .then(function(j){applyEnt(j);online=true;return true;})
         .catch(function(){online=false;return false;});
     });
   }
   function refreshEntitlements(){ // 支付成功后刷新档位
-    return fetch('/api/me/entitlements',{headers:{'X-User-Token':token()},signal:AbortSignal.timeout(4000)})
+    return fetch(API_BASE + '/api/me/entitlements',{headers:{'X-User-Token':token()},signal:AbortSignal.timeout(4000)})
       .then(function(r){return r.json();})
       .then(applyEnt)
       .catch(function(){return ent;});
   }
   function createOrder(cycle){
-    return fetch('/api/orders',{method:'POST',
+    return fetch(API_BASE + '/api/orders',{method:'POST',
       headers:{'Content-Type':'application/json','X-User-Token':token()},
       body:JSON.stringify({plan:'pro',cycle:cycle}),signal:AbortSignal.timeout(30000)})
       .then(function(r){return r.json();});
   }
   function mockPay(orderId){ // 仅演示通道订单可用
-    return fetch('/api/orders/'+orderId+'/mock-pay',{method:'POST',signal:AbortSignal.timeout(10000)})
+    return fetch(API_BASE + '/api/orders/'+orderId+'/mock-pay',{method:'POST',signal:AbortSignal.timeout(10000)})
       .then(function(r){return r.json();});
   }
   return {health:health,token:token,refreshEntitlements:refreshEntitlements,
@@ -2151,7 +2167,7 @@ function ensureAIAudio(item,meta,prompt,onStage,cancelToken){
         attempts++;
         onStage('补齐音频：AI 旁白合成中（第 '+attempts+' 次尝试）…',0.88);
         // 60s 超时：TTS 合成可能较慢（真实 CosyVoice 排队），避免请求挂起卡死流程
-        fetch('/api/ai/tts',{method:'POST',headers:{'Content-Type':'application/json'},
+        fetch(API_BASE + '/api/ai/tts',{method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({text:prompt}),signal:AbortSignal.timeout(60000)})
           .then(function(r){return r.json().then(function(j){return {code:r.status,j:j};});})
           .then(function(res){
@@ -2864,7 +2880,7 @@ function renderDubPanel(box){
     var text=ta.value.trim();
     if(!text){st.className='dub-status err';st.textContent='请先输入配音文案';return;}
     btn.disabled=true;st.className='dub-status';st.textContent='AI 配音合成中…';
-    fetch('/api/ai/tts',{method:'POST',headers:{'Content-Type':'application/json'},
+    fetch(API_BASE + '/api/ai/tts',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({text:text,voice:sel.value}),signal:AbortSignal.timeout(60000)})
       .then(function(r){return r.json().then(function(j){return {code:r.status,j:j};});})
       .then(function(res){
@@ -3427,7 +3443,7 @@ function openCheckoutServer(onPaid){
       // 轮询订单状态（真实通道=查支付宝；演示通道=本地判定），支付成功自动升级
       pollT=setInterval(function(){
         if(!els.modalMask.classList.contains('open'))return teardown();
-        fetch('/api/orders/'+j.orderId+'/status',{signal:AbortSignal.timeout(8000)})
+        fetch(API_BASE + '/api/orders/'+j.orderId+'/status',{signal:AbortSignal.timeout(8000)})
           .then(function(r){return r.json();})
           .then(function(s){
             if(s.status==='paid'&&!paid)onPaidDone();
