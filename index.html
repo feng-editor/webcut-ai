@@ -719,6 +719,7 @@ var API_BASE = '';
 <!-- 云同步模块（WebCutCloud 工厂；file:// 兼容的经典脚本） -->
 <script src="js/cloud-sync.js"></script>
 <script src="js/dag-engine.js"></script>
+<script src="js/render-coordinator.js"></script>
 
 <script>
 (function(){
@@ -2450,6 +2451,53 @@ function drawPreview(){
   var r=fitCanvas(els.previewCanvas);
   var ctx=r.ctx,w=r.w,h=r.h;
   if(w<10||h<10)return;
+
+  // ===== Worker 渲染路径（第二步架构：DAG 求值 + 效果链在 Worker 内完成） =====
+  // 当选中片段有 renderGraph 且 Worker 可用时，优先走 Worker 渲染
+  var selClip=getSel();
+  if(selClip&&selClip.renderGraph&&window._renderCoord&&window._renderCoord.enabled){
+    var graph=JSON.parse(JSON.stringify(selClip.renderGraph));
+    var tMs=Math.round((State.playhead-selClip.start)*1000);
+    // 获取当前视频帧的 bitmap
+    var layer=null;
+    try{layer=videoLayersAt(State.playhead)[0];}catch(e){}
+    var frameBitmap=null;
+    if(layer){
+      var f=Engine.videoDecoder.getFrame(layer.clip.sourceId,layer.srcTime);
+      if(f)frameBitmap=f.bitmap;
+    }
+    // 异步渲染：Worker 返回 ImageBitmap → 主线程上屏
+    if(frameBitmap){
+      // 注意：frameBitmap 是缓存帧，不能转移所有权
+      // 画到临时 canvas 再生成新 bitmap（零拷贝的代价是源帧需要复制）
+      var tmpCv=document.createElement('canvas');
+      tmpCv.width=frameBitmap.width;tmpCv.height=frameBitmap.height;
+      tmpCv.getContext('2d').drawImage(frameBitmap,0,0);
+      var tmpBitmap=tmpCv.transferToImageBitmap();
+      window._renderCoord.render(graph,tMs,Math.round(w),Math.round(h),tmpBitmap)
+        .then(function(result){
+          ctx.fillStyle='#000';
+          ctx.fillRect(0,0,w,h);
+          var bm=result.bitmap;
+          var s=Math.min(w/bm.width,h/bm.height);
+          var dw=bm.width*s,dh=bm.height*s;
+          ctx.drawImage(bm,(w-dw)/2,(h-dh)/2,dw,dh);
+          bm.close(); // 释放
+          result.bitmap=null;
+        })
+        .catch(function(e){
+          // Worker 渲染失败 → 降级主线程渲染
+          drawPreviewMain(ctx,w,h);
+        });
+      return; // Worker 已处理本帧
+    }
+  }
+
+  // ===== 主线程渲染路径（默认 / Worker 不可用时降级） =====
+  drawPreviewMain(ctx,w,h);
+}
+
+function drawPreviewMain(ctx,w,h){
   var g=ctx.createLinearGradient(0,0,0,h);
   g.addColorStop(0,'#0d1326');g.addColorStop(1,'#111a33');
   ctx.fillStyle=g;ctx.fillRect(0,0,w,h);
@@ -4832,8 +4880,15 @@ function init(){
   // 离开页面前尽力保存（平时由 endChange 防抖自动保存覆盖）
   window.addEventListener('beforeunload',function(){try{ProjectStore.saveNow();}catch(e){}});
 
+  // Render Worker 初始化（第二步架构：OffscreenCanvas + ImageBitmap 零拷贝）
+  if(window.RenderCoordinator){
+    window._renderCoord=new RenderCoordinator();
+    console.log('[WebCut] Render Worker:',window._renderCoord.enabled?'已启用（零拷贝渲染）':'降级主线程');
+  }
+
   // 暴露调试 / 二期接入入口
   window.__EDITOR__={State:State,Engine:Engine,AIClient:AIClient,ProjectStore:ProjectStore,CloudSync:CloudSync,
+    RenderCoordinator:window._renderCoord,DAGEngine:window.DAGEngine,
     muxMp4FromChunks:muxMp4FromChunks,mockGenerateVideo:mockGenerateVideo,makeMockBGM:makeMockBGM,version:'0.2.0-phase2'};
 }
 
