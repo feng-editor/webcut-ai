@@ -7,6 +7,7 @@
 # ============================================================
 import sys
 import io
+import os
 
 # 强制 stdout/stderr 使用 UTF-8（修复 Docker 容器内 latin-1 编码错误）
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -15,7 +16,6 @@ os.environ['PYTHONIOENCODING'] = 'utf-8'
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-import os
 import json
 import time
 import uuid
