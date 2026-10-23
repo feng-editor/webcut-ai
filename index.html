@@ -718,6 +718,7 @@ var API_BASE = '';
 <script src="entitlements-config.js"></script>
 <!-- 云同步模块（WebCutCloud 工厂；file:// 兼容的经典脚本） -->
 <script src="js/cloud-sync.js"></script>
+<script src="js/dag-engine.js"></script>
 
 <script>
 (function(){
@@ -3086,17 +3087,53 @@ function renderProps(){
       mkSelect(sec.body,'变声',[['none','无'],['loli','萝莉'],['uncle','大叔'],['kid','正太'],['robot','机器人'],['electro','电音']],
         function(){return c.props.voice;},function(v){c.props.voice=v;});
     }else if(key==='keyframe'){
+      // DAG 关键帧系统：支持缓动函数选择 + 任意参数关键帧
       var row=el('div','btn-row');
       var bAdd=el('button','btn sm',icon('diamond',12)+' 添加关键帧');
       var bDel=el('button','btn sm',icon('trash',12)+' 删除');
+      // 缓动函数选择
+      var easeRow=el('div','prow');
+      easeRow.appendChild(el('label','','缓动'));
+      var easeSel=document.createElement('select');
+      easeSel.className='ctl';
+      ['linear','easeIn','easeOut','easeInOut','easeInCubic','easeOutCubic','easeOutBounce','step'].forEach(function(e){
+        var o=document.createElement('option');o.value=e;o.textContent=e;easeSel.appendChild(o);
+      });
+      easeSel.value=c.props.kfEasing||'easeInOut';
+      easeSel.addEventListener('change',function(){c.props.kfEasing=easeSel.value;});
+      easeRow.appendChild(easeSel);
+      easeRow.appendChild(el('span','',''));
+      sec.body.appendChild(easeRow);
+      // 参数选择（对哪个参数加关键帧）
+      var paramRow=el('div','prow');
+      paramRow.appendChild(el('label','','参数'));
+      var paramSel=document.createElement('select');
+      paramSel.className='ctl';
+      var paramOpts=['opacity','scale','x','y','rotation'];
+      paramOpts.forEach(function(p){
+        var o=document.createElement('option');o.value=p;
+        o.textContent={opacity:'不透明度',scale:'缩放',x:'位置X',y:'位置Y',rotation:'旋转'}[p]||p;
+        paramSel.appendChild(o);
+      });
+      paramSel.value='opacity';
+      paramRow.appendChild(paramSel);
+      paramRow.appendChild(el('span','',''));
+      sec.body.appendChild(paramRow);
       bAdd.addEventListener('click',function(){
         beginChange();
         var t=clamp(State.playhead-c.start,0,c.duration);
+        // 使用 DAG 引擎添加参数关键帧
+        if(!c.renderGraph)c.renderGraph=DAGEngine.createDefaultGraph(c.props);
+        var nodeId='node_transform';
+        var value=c.props[paramSel.value]!=null?c.props[paramSel.value]:(paramSel.value==='opacity'?100:0);
+        DAGEngine.addKeyframe(c.renderGraph,nodeId,paramSel.value,Math.round(t*1000),value,easeSel.value);
+        // 同步旧版 keyframes（用于时间轴显示）
         if(!c.keyframes.some(function(k){return Math.abs(k-t)<0.02;})){
           c.keyframes.push(t);c.keyframes.sort(function(a,b){return a-b;});
           State.selKF=c.keyframes.indexOf(t);
         }
         endChange();renderProps();
+        toast('已为「'+paramSel.options[paramSel.selectedIndex].text+'」添加关键帧（'+easeSel.value+'）');
       });
       bDel.addEventListener('click',function(){
         if(State.selKF==null||!c.keyframes[State.selKF])return toast('请先在关键帧条中选择一个关键帧');
@@ -3123,7 +3160,7 @@ function renderProps(){
       });
       sec.body.appendChild(strip);
       sec.body.appendChild(el('div','sec-hint',
-        '关键帧驱动属性随时间变化（以「不透明度」为例），插值渲染将在接入 WebGPU 合成管线后生效。'));
+        'DAG 关键帧引擎已接入：选择参数和缓动函数后点击「添加关键帧」，属性将按缓动曲线自动插值。支持 8 种缓动（linear/easeInOut/easeOutBounce 等），可在时间轴不同位置添加多个关键帧形成动画。'));
     }
     body.appendChild(sec.root);
   });
