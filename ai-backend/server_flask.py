@@ -64,6 +64,7 @@ PAY_FILE = os.path.join(DATA_DIR, 'payments.json')
 os.makedirs(TMP, exist_ok=True)
 
 TASKS = {}  # AI 生成任务
+TASKS_LOCK = threading.Lock()  # Flask threaded=True 下保护 TASKS 并发访问
 _db_lock = threading.Lock()
 
 print('=== WebCut 后端启动 ===')
@@ -200,14 +201,16 @@ def create_video_task():
 
 @app.route('/api/ai/video/<task_id>', methods=['GET'])
 def get_video_status(task_id):
-    t = TASKS.get(task_id)
-    if not t:
-        return jsonify({'error': '任务不存在'}), 404
-    return jsonify({
-        'status': t['status'], 'progress': t['progress'], 'stage': t['stage'],
-        'error': t['error'],
-        'url': ('/ai-media/' + t['video_file']) if t.get('video_file') else None
-    })
+    with TASKS_LOCK:
+        t = TASKS.get(task_id)
+        if not t:
+            return jsonify({'error': '任务不存在'}), 404
+        # 返回快照，避免轮询线程在序列化时并发修改
+        return jsonify({
+            'status': t['status'], 'progress': t['progress'], 'stage': t['stage'],
+            'error': t['error'],
+            'url': ('/ai-media/' + t['video_file']) if t.get('video_file') else None
+        })
 
 
 # ============================================================
@@ -291,8 +294,12 @@ def _synth_demo_wav(fpath, text):
 # ============================================================
 @app.route('/ai-media/<path:filename>', methods=['GET'])
 def serve_media(filename):
-    fpath = os.path.join(TMP, os.path.basename(filename))
-    if not os.path.exists(fpath):
+    # basename 已经防了目录穿越，再加 realpath 双保险
+    safe_name = os.path.basename(filename)
+    if not safe_name or safe_name.startswith('.'):
+        return jsonify({'error': '文件不存在'}), 404
+    fpath = os.path.realpath(os.path.join(TMP, safe_name))
+    if not fpath.startswith(os.path.realpath(TMP) + os.sep) or not os.path.isfile(fpath):
         return jsonify({'error': '文件不存在'}), 404
     return send_file(fpath)
 
@@ -494,13 +501,19 @@ def cloud_usage():
 
 
 # ============================================================
-# 静态文件（编辑器前端）
+# 静态文件（编辑器前端）—— 含路径遍历防护
 # ============================================================
 @app.route('/', defaults={'path': 'index.html'})
 @app.route('/<path:path>')
 def serve_static(path):
+    # 路径遍历防护：拒绝 .. 、反斜杠、空字节；解析后必须在 ROOT 内
+    if '..' in path or '\\' in path or '\x00' in path:
+        return jsonify({'error': 'not found'}), 404
     fpath = os.path.abspath(os.path.join(ROOT, path))
-    if not fpath.startswith(os.path.abspath(ROOT)) or not os.path.isfile(fpath):
+    # 双重校验：abspath 前缀 + realpath（防符号链接逃逸）
+    real_root = os.path.realpath(ROOT)
+    real_path = os.path.realpath(fpath)
+    if not real_path.startswith(real_root + os.sep) or not os.path.isfile(real_path):
         return jsonify({'error': 'not found'}), 404
     return send_file(fpath)
 
