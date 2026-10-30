@@ -690,6 +690,10 @@ body.lib-dragging,body.lib-dragging *{cursor:grabbing!important;user-select:none
         <button class="btn iconb" id="btnSplit" title="分割选中片段 (S)"></button>
         <button class="btn iconb" id="btnDel" title="删除选中片段 (Del)"></button>
         <div class="vdiv"></div>
+        <button class="btn iconb" id="btnCopy" title="复制 (Ctrl+C)"></button>
+        <button class="btn iconb" id="btnPaste" title="粘贴到播放头 (Ctrl+V)"></button>
+        <button class="btn iconb" id="btnDup" title="创建副本 (Ctrl+D)"></button>
+        <div class="vdiv"></div>
         <button class="btn iconb" id="btnSnap" title="吸附开关"></button>
         <button class="btn iconb" id="btnFit" title="缩放以适应全部"></button>
         <div class="spacer"></div>
@@ -883,7 +887,16 @@ var ICONS={
   maskrect:'<rect x="5" y="6" width="14" height="12" rx="1"/>',
   maskpen:'<path d="M12 19l7-7-4-4-7 7-1 5z"/><path d="M15 8l1.5-1.5a2.1 2.1 0 0 1 3 3L18 11"/>',
   user:'<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6 8-6s8 2 8 6"/>',
-  logout:'<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>'
+  logout:'<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
+  copy:'<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  paste:'<rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>',
+  duplicate:'<rect x="8" y="8" width="12" height="12" rx="2"/><line x1="4" y1="16" x2="4" y2="4"/><polyline points="16 4 4 4"/>',
+  selectall:'<rect x="3" y="3" width="18" height="18" rx="2" stroke-dasharray="4 3"/><line x1="8" y1="12" x2="16" y2="12"/>',
+  skipback:'<polygon points="19 20 9 12 19 4" fill="currentColor" stroke="none"/><line x1="5" y1="19" x2="5" y2="5"/>',
+  camera:'<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
+  wand:'<line x1="3" y1="21" x2="15" y2="9"/><path d="M14.5 6.5l3 3"/><path d="M19 2l.9 2.1L22 5l-2.1.9L19 8l-.9-2.1L16 5l2.1-.9z"/><path d="M7 3l.6 1.4L9 5l-1.4.6L7 7l-.6-1.4L5 5l1.4-.6z"/>',
+  layers:'<polygon points="12 2 2 7 12 12 22 7"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
+  crop:'<path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/>'
 };
 function icon(name,size){
   size=size||16;
@@ -2370,6 +2383,7 @@ var State={
   tracks:[],           // {id,type,name,locked,hidden,muted}
   clips:[],            // {id,trackId,start,duration,label,props,keyframes}
   selection:null,
+  multiSel:[],         // 多选片段 id 集合（Ctrl 点选 / 空白框选）；非空时批量操作生效
   selKF:null,          // 选中关键帧索引
   playhead:0,
   playing:false,
@@ -2437,6 +2451,7 @@ function endChange(){
 function restore(s){
   var o=JSON.parse(s);State.tracks=o.tracks;State.clips=o.clips;
   if(State.selection&&!State.clips.some(function(c){return c.id===State.selection;})){State.selection=null;State.selKF=null;}
+  if(State.multiSel&&State.multiSel.length)State.multiSel=State.multiSel.filter(function(id){return State.clips.some(function(c){return c.id===id;});});
   renderHeaders();renderProps();requestRender();
 }
 function undo(){if(pending!=null)endChange();if(!undoStack.length)return;redoStack.push(snapshot());restore(undoStack.pop());updateHistoryButtons();}
@@ -2450,6 +2465,11 @@ function projectDuration(){
   return d;
 }
 function getSel(){for(var i=0;i<State.clips.length;i++)if(State.clips[i].id===State.selection)return State.clips[i];return null;}
+function getClipById(id){for(var i=0;i<State.clips.length;i++)if(State.clips[i].id===id)return State.clips[i];return null;}
+/* ---------- 多选支持：当前生效的选择集合（multiSel 非空时优先） ---------- */
+function selIds(){return State.multiSel.length?State.multiSel.slice():(State.selection?[State.selection]:[]);}
+function selClips(){var out=[];selIds().forEach(function(id){var c=getClipById(id);if(c)out.push(c);});return out;}
+function setSingleSel(id){State.selection=id;State.multiSel=[];State.selKF=null;}
 function trackTypeOf(c){var t=findTrack(c.trackId);return t?t.type:'video';}
 function findTrack(id){for(var i=0;i<State.tracks.length;i++)if(State.tracks[i].id===id)return State.tracks[i];return null;}
 function trackIndex(tr){for(var i=0;i<State.tracks.length;i++)if(State.tracks[i]===tr)return i;return -1;}
@@ -2747,6 +2767,15 @@ function drawTimeline(){
       ctx.setLineDash([4,3]);ctx.strokeStyle='rgba(255,255,255,0.6)';ctx.stroke();ctx.setLineDash([]);
     }
   }
+  // 框选矩形（多选）
+  if(drag&&drag.mode==='marquee'){
+    var mx0=Math.min(drag.x0,drag.x1),mx1=Math.max(drag.x0,drag.x1);
+    var my0=Math.max(RULER_H,Math.min(drag.y0,drag.y1)),my1=Math.max(drag.y0,drag.y1);
+    ctx.fillStyle='rgba(109,178,255,0.10)';
+    ctx.fillRect(mx0,my0,mx1-mx0,my1-my0);
+    ctx.strokeStyle='rgba(109,178,255,0.7)';ctx.lineWidth=1;
+    ctx.strokeRect(mx0+0.5,my0+0.5,mx1-mx0-1,my1-my0-1);
+  }
   // 吸附参考线（霓虹紫发光）
   if(State.snapLineT!=null){
     var sx=timeToX(State.snapLineT);
@@ -2879,12 +2908,30 @@ function drawClip(ctx,c,x,y,w,h){
     ctx.fillText(label,x+pad,y+h/2+0.5);
   }
   ctx.restore();
+  // 多选态（非主选中但属于多选集合）：细边框高亮
+  if(State.multiSel.length>1&&State.multiSel.indexOf(c.id)>=0&&State.selection!==c.id){
+    rr(ctx,x+0.5,y+0.5,w-1,h-1,4);
+    ctx.strokeStyle='rgba(109,178,255,0.55)';ctx.lineWidth=1;ctx.stroke();
+  }
   // 选中态
   if(State.selection===c.id){
     rr(ctx,x+0.5,y+0.5,w-1,h-1,4);
     ctx.strokeStyle='#6db2ff';ctx.lineWidth=1.5;
     ctx.shadowColor='rgba(109,178,255,.4)';ctx.shadowBlur=4;ctx.stroke();ctx.shadowBlur=0;
     if(w>18){ctx.fillStyle='#fff';ctx.fillRect(x-2,y+h/2-5,5,10);ctx.fillRect(x+w-3,y+h/2-5,5,10);}
+  }
+  // 关键帧菱形标记（沿片段底边）
+  if(c.keyframes&&c.keyframes.length&&h>=24){
+    for(var kf=0;kf<c.keyframes.length;kf++){
+      var kt=c.keyframes[kf];
+      if(kt<0||kt>c.duration)continue;
+      var kx=x+clamp(kt/c.duration,0,1)*w;
+      ctx.save();
+      ctx.translate(kx,y+h-5);ctx.rotate(Math.PI/4);
+      ctx.fillStyle=(State.selKF===kf)?'#6db2ff':'rgba(232,234,238,0.85)';
+      ctx.fillRect(-2.5,-2.5,5,5);
+      ctx.restore();
+    }
   }
   ctx.restore();
 }
@@ -3405,28 +3452,75 @@ function seekTo(t){State.playhead=Math.max(0,t);updateTimeUI();requestRender();e
 
 /* ---------- 片段操作 ---------- */
 function splitSelected(){
-  var c=getSel();
-  if(!c)return toast('请先选择一个片段');
-  var t=State.playhead;
-  if(!(t>c.start+0.05&&t<c.start+c.duration-0.05))return toast('播放头需位于选中片段内部');
+  var cs=selClips();
+  if(!cs.length)return toast('请先选择片段');
+  var t=State.playhead,done=0;
   beginChange();
-  var right=JSON.parse(JSON.stringify(c));
-  right.id=uid('c');
-  c.keyframes=c.keyframes.filter(function(k){return k<c.duration;});
-  right.start=t;right.duration=c.start+c.duration-t;
-  right.keyframes=c.keyframes.filter(function(k){return k>=c.duration;}).map(function(k){return k-c.duration;});
-  c.keyframes=c.keyframes.filter(function(k){return k<c.duration;});
-  c.duration=t-c.start;
-  State.clips.push(right);
-  State.selection=right.id;State.selKF=null;
-  endChange();renderProps();requestRender();
+  cs.forEach(function(c){
+    if(!(t>c.start+0.05&&t<c.start+c.duration-0.05))return;
+    var right=JSON.parse(JSON.stringify(c));
+    right.id=uid('c');
+    right.start=t;right.duration=c.start+c.duration-t;
+    right.keyframes=c.keyframes.filter(function(k){return k>=c.duration;}).map(function(k){return k-c.duration;});
+    c.keyframes=c.keyframes.filter(function(k){return k<c.duration;});
+    c.duration=t-c.start;
+    State.clips.push(right);done++;
+    if(State.selection===c.id)State.selection=right.id;
+    var mi=State.multiSel.indexOf(c.id);
+    if(mi>=0)State.multiSel[mi]=right.id;
+  });
+  endChange();
+  if(!done)return toast('播放头需位于选中片段内部');
+  State.selKF=null;renderProps();requestRender();
+  toast('已分割 '+done+' 个片段');
 }
 function deleteSelected(){
-  var c=getSel();if(!c)return;
+  var ids=selIds();
+  if(!ids.length)return toast('请先选择片段');
   beginChange();
-  State.clips=State.clips.filter(function(x){return x.id!==c.id;});
-  State.selection=null;State.selKF=null;
+  State.clips=State.clips.filter(function(x){return ids.indexOf(x.id)<0;});
+  State.selection=null;State.selKF=null;State.multiSel=[];
   endChange();renderProps();requestRender();
+}
+/* ---------- 复制 / 粘贴 / 副本（专业时间线操作） ---------- */
+var clipClipboard=null;
+function copySelected(){
+  var cs=selClips();
+  if(!cs.length)return toast('请先选择片段');
+  clipClipboard=JSON.parse(JSON.stringify(cs));
+  toast('已复制 '+cs.length+' 个片段（Ctrl+V 在播放头处粘贴）');
+}
+function pasteClips(baseTime){
+  if(!clipClipboard||!clipClipboard.length)return toast('剪贴板为空（先 Ctrl+C 复制片段）');
+  var minStart=Infinity;
+  clipClipboard.forEach(function(c){minStart=Math.min(minStart,c.start);});
+  var base=Math.max(0,baseTime!=null?baseTime:State.playhead);
+  beginChange();
+  var newIds=[];
+  clipClipboard.forEach(function(c){
+    var n=JSON.parse(JSON.stringify(c));
+    n.id=uid('c');n.start=base+(c.start-minStart);
+    // 目标轨道：原轨道不存在或已锁定 → 找同类型可用轨道，实在没有则新建
+    var tr=findTrack(n.trackId),type=tr?tr.type:'video';
+    if(!tr||tr.locked){
+      tr=null;
+      for(var i=0;i<State.tracks.length;i++)if(State.tracks[i].type===type&&!State.tracks[i].locked){tr=State.tracks[i];break;}
+      if(!tr)tr=addTrackOf(type);
+    }
+    n.trackId=tr.id;
+    State.clips.push(n);newIds.push(n.id);
+  });
+  State.selection=newIds[0];State.multiSel=newIds;State.selKF=null;
+  endChange();renderHeaders();renderProps();requestRender();
+  toast('已粘贴 '+newIds.length+' 个片段');
+}
+function duplicateSelected(){
+  var cs=selClips();
+  if(!cs.length)return toast('请先选择片段');
+  var spanEnd=0,minStart=Infinity;
+  cs.forEach(function(c){spanEnd=Math.max(spanEnd,c.start+c.duration);minStart=Math.min(minStart,c.start);});
+  clipClipboard=JSON.parse(JSON.stringify(cs));
+  pasteClips(spanEnd); // 副本紧跟原选择区间末尾（保持内部相对时序）
 }
 function addTrackOf(type){ // 纯状态操作，不进历史
   var count=State.tracks.filter(function(t){return t.type===type;}).length+1;
@@ -3483,25 +3577,54 @@ function hoverCursor(x,y){
 }
 function bindTimelinePointer(){
   var cv=els.tlCanvas;
-  cv.addEventListener('contextmenu',function(e){e.preventDefault();});
+  cv.addEventListener('contextmenu',function(e){e.preventDefault();openTimelineCtx(e.clientX,e.clientY);});
   cv.addEventListener('pointerdown',function(e){
     if(e.button!==0)return;
+    hideCtxMenu();
     try{cv.setPointerCapture(e.pointerId);}catch(err){}
     var rect=cv.getBoundingClientRect();
     var x=e.clientX-rect.left,y=e.clientY-rect.top;
     if(y<RULER_H){setPlaying(false);drag={mode:'playhead'};seekTo(xToTime(x));return;}
     var tr=trackAtY(y);
-    if(!tr){if(State.selection){State.selection=null;State.selKF=null;renderProps();requestRender();}return;}
+    if(!tr){if(State.selection||State.multiSel.length){setSingleSel(null);renderProps();requestRender();}return;}
     var t=xToTime(x),c=hitClip(tr,t);
-    if(!c){if(State.selection){State.selection=null;State.selKF=null;renderProps();requestRender();}return;}
+    if(!c){
+      if(e.shiftKey||e.ctrlKey||e.metaKey)return; // 修饰键 + 空白：保留现有选择
+      if(State.selection||State.multiSel.length){setSingleSel(null);renderProps();requestRender();}
+      if(tr.locked)return;
+      drag={mode:'marquee',x0:x,y0:y,x1:x,y1:y}; // 空白拖动 → 框选
+      requestRender();
+      return;
+    }
+    // Ctrl / Cmd 点选：切换多选集合
+    if(e.ctrlKey||e.metaKey){
+      var mi=State.multiSel.indexOf(c.id);
+      if(mi>=0){State.multiSel.splice(mi,1);if(!State.multiSel.length)State.selection=c.id;}
+      else{State.multiSel.push(c.id);State.selection=c.id;}
+      renderProps();requestRender();
+      if(!State.multiSel.length||tr.locked)return;
+      drag={mode:'moveMulti',clipId:c.id,grabStart:c.start,downX:x,downY:y,moved:false,
+        group:State.multiSel.map(function(id){var g=getClipById(id);return g?{id:id,start:g.start,trackId:g.trackId}:null;}).filter(Boolean)};
+      beginChange();
+      return;
+    }
     if(tr.locked)return toast('轨道「'+tr.name+'」已锁定，解锁后可编辑');
-    if(State.selection!==c.id){State.selection=c.id;State.selKF=null;renderProps();}
+    // 单击已处于多选集合中的片段 → 整组拖动；否则回到单选
+    var inGroup=State.multiSel.indexOf(c.id)>=0;
+    if(!inGroup){
+      setSingleSel(c.id);renderProps();
+    }else if(State.selection!==c.id){State.selection=c.id;renderProps();}
     var mode='move';
-    if(c.duration*State.pps>16){
+    if(!inGroup&&c.duration*State.pps>16){
       if(Math.abs(x-timeToX(c.start))<6)mode='trimL';
       else if(Math.abs(x-timeToX(c.start+c.duration))<6)mode='trimR';
     }
-    drag={mode:mode,clipId:c.id,origStart:c.start,origDur:c.duration,downX:x,downY:y};
+    if(mode==='move'&&State.multiSel.length){
+      drag={mode:'moveMulti',clipId:c.id,grabStart:c.start,downX:x,downY:y,moved:false,
+        group:State.multiSel.map(function(id){var g=getClipById(id);return g?{id:id,start:g.start,trackId:g.trackId}:null;}).filter(Boolean)};
+    }else{
+      drag={mode:mode,clipId:c.id,origStart:c.start,origDur:c.duration,downX:x,downY:y};
+    }
     beginChange();
     requestRender();
   });
@@ -3509,13 +3632,27 @@ function bindTimelinePointer(){
     var rect=cv.getBoundingClientRect();
     var x=e.clientX-rect.left,y=e.clientY-rect.top;
     if(!drag){hoverCursor(x,y);return;}
-    var c=null;
-    for(var i=0;i<State.clips.length;i++)if(State.clips[i].id===drag.clipId){c=State.clips[i];break;}
+    if(drag.mode==='marquee'){
+      drag.x1=x;drag.y1=y;requestRender();return;
+    }
+    var c=getClipById(drag.clipId);
     if(!c){drag=null;return;}
     if(drag.mode==='playhead'){seekTo(Math.max(0,xToTime(x)));return;}
     var dt=(x-drag.downX)/State.pps;
     State.snapLineT=null;
-    if(drag.mode==='move'){
+    if(drag.mode==='moveMulti'){
+      // 整组拖动：以被抓片段的吸附结果为基准平移全组；垂直换轨只作用于被抓片段
+      var s=snapTime(drag.grabStart+dt,c.id);
+      var base=Math.max(0,s.t),shift=base-drag.grabStart;
+      if(s.snapped!=null&&base===s.snapped)State.snapLineT=s.snapped;
+      var ty=trackAtY(y),tt=trackTypeOf(c);
+      if(ty&&!ty.locked&&ty.type===tt&&ty.id!==c.trackId){c.trackId=ty.id;renderHeaders();}
+      drag.group.forEach(function(g){
+        var gc=getClipById(g.id);
+        if(gc){gc.start=Math.max(0,g.start+shift);if(gc.id!==c.id&&gc.trackId!==g.trackId)gc.trackId=g.trackId;}
+      });
+      drag.moved=true;
+    }else if(drag.mode==='move'){
       var s=snapTime(drag.origStart+dt,c.id);
       c.start=Math.max(0,s.t);
       if(s.snapped!=null&&c.start===s.snapped)State.snapLineT=s.snapped;
@@ -3536,7 +3673,9 @@ function bindTimelinePointer(){
   });
   var finish=function(){
     if(!drag)return;
-    if(drag.mode!=='playhead')endChange();
+    if(drag.mode==='marquee'){applyMarquee(drag);drag=null;requestRender();return;}
+    if(drag.mode==='moveMulti'&&!drag.moved){endChange();} // 未真正移动 → 不留历史
+    else if(drag.mode!=='playhead')endChange();
     State.snapLineT=null;drag=null;requestRender();
   };
   cv.addEventListener('pointerup',finish);
@@ -3560,6 +3699,75 @@ function zoomAt(x,f){
   State.pps=clamp(State.pps*f,2,240);
   State.scrollX=clamp(t*State.pps-x,0,maxScrollX());
   syncZoomUI();requestRender();
+}
+/* ---------- 框选：矩形与片段包围盒求交，命中进多选 ---------- */
+function applyMarquee(m){
+  var x0=Math.min(m.x0,m.x1),x1=Math.max(m.x0,m.x1),y0=Math.min(m.y0,m.y1),y1=Math.max(m.y0,m.y1);
+  if(x1-x0<5&&y1-y0<5)return; // 视为点击而非框选
+  var t0=xToTime(x0),t1=xToTime(x1);
+  var hitIds=[];
+  State.clips.forEach(function(c){
+    var tr=findTrack(c.trackId);if(!tr)return;
+    var ry=trackYOf(tr);
+    if(ry==null)return;
+    var cy0=ry, cy1=ry+TRACK_H[tr.type];
+    if(c.start<t1&&c.start+c.duration>t0&&cy1>y0&&cy0<y1)hitIds.push(c.id);
+  });
+  if(!hitIds.length)return;
+  State.multiSel=hitIds;State.selection=hitIds[0];State.selKF=null;
+  renderProps();
+  toast('已选中 '+hitIds.length+' 个片段');
+}
+function trackYOf(tr){
+  var y=RULER_H-State.scrollY;
+  for(var i=0;i<State.tracks.length;i++){
+    var t=State.tracks[i],h=TRACK_H[t.type];
+    if(t===tr)return y;
+    y+=h+GAP;
+  }
+  return null;
+}
+/* ---------- 右键上下文菜单 ---------- */
+function hideCtxMenu(){if(els.ctxMenu)els.ctxMenu.classList.remove('open');}
+function openTimelineCtx(cx,cy){
+  var rect=els.tlCanvas.getBoundingClientRect();
+  var x=cx-rect.left,y=cy-rect.top;
+  var tr=y>=RULER_H?trackAtY(y):null;
+  var c=tr?hitClip(tr,xToTime(x)):null;
+  if(c&&State.multiSel.indexOf(c.id)<0){setSingleSel(c.id);renderProps();requestRender();}
+  var m=els.ctxMenu;m.innerHTML='';
+  var add=function(label,ic,fn,keys,dis){
+    var it=el('div','ctx-item'+(dis?' disabled':''),icon(ic,13)+'<span>'+label+'</span>'+(keys?'<span class="keys">'+keys+'</span>':''));
+    if(!dis)it.addEventListener('click',function(){hideCtxMenu();fn();});
+    m.appendChild(it);
+  };
+  if(c){
+    var n=selClips().length||1;
+    add('分割','scissors',splitSelected,'S',!(State.playhead>c.start+0.05&&State.playhead<c.start+c.duration-0.05)&&n===1);
+    add('复制','copy',copySelected,'Ctrl+C');
+    add('创建副本','duplicate',duplicateSelected,'Ctrl+D');
+    m.appendChild(el('div','ctx-sep'));
+    add('删除','trash',deleteSelected,'Del');
+    m.appendChild(el('div','ctx-sep'));
+    add('缩放适应全部','fit',function(){els.btnFit.click();});
+  }else{
+    add('粘贴','paste',function(){pasteClips(State.playhead);},'Ctrl+V',!clipClipboard);
+    add('全选片段','selectall',selectAllClips,'Ctrl+A');
+    m.appendChild(el('div','ctx-sep'));
+    add('缩放适应全部','fit',function(){els.btnFit.click();});
+    add('回到起点','skipback',function(){seekTo(0);},'Home');
+  }
+  m.classList.add('open');
+  var mw=m.offsetWidth,mh=m.offsetHeight;
+  m.style.left=Math.min(cx,innerWidth-mw-8)+'px';
+  m.style.top=Math.min(cy,innerHeight-mh-8)+'px';
+}
+function selectAllClips(){
+  if(!State.clips.length)return toast('时间线上没有片段');
+  State.multiSel=State.clips.map(function(c){return c.id;});
+  State.selection=State.multiSel[0];State.selKF=null;
+  renderProps();requestRender();
+  toast('已全选 '+State.multiSel.length+' 个片段');
 }
 
 /* ---------- 权益门控（配置来自 entitlements-config.js，缺失时降级为全量可用） ---------- */
@@ -4594,11 +4802,16 @@ function bindKeyboard(){
       if(document.activeElement&&document.activeElement.tagName==='BUTTON')document.activeElement.blur();
       setPlaying(!State.playing);
     }
-    else if(k==='Delete'||k==='Backspace'){if(State.selection){e.preventDefault();deleteSelected();}}
+    else if(k==='Delete'||k==='Backspace'){if(selIds().length){e.preventDefault();deleteSelected();}}
     else if((e.ctrlKey||e.metaKey)&&kc==='s'){e.preventDefault();ProjectStore.saveNow().then(function(ok){if(ok)toast('工程已保存 ✓');});}
     else if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&kc==='z'){e.preventDefault();undo();}
     else if((e.ctrlKey||e.metaKey)&&kc==='y'){e.preventDefault();redo();}
     else if((e.ctrlKey||e.metaKey)&&e.shiftKey&&kc==='z'){e.preventDefault();redo();}
+    else if((e.ctrlKey||e.metaKey)&&kc==='c'){e.preventDefault();copySelected();}
+    else if((e.ctrlKey||e.metaKey)&&kc==='v'){e.preventDefault();pasteClips(State.playhead);}
+    else if((e.ctrlKey||e.metaKey)&&kc==='d'){e.preventDefault();duplicateSelected();}
+    else if((e.ctrlKey||e.metaKey)&&kc==='a'){e.preventDefault();selectAllClips();}
+    else if(k==='Escape'){if(selIds().length){setSingleSel(null);renderProps();requestRender();}}
     else if(kc==='s'&&!e.ctrlKey&&!e.metaKey){splitSelected();}
     else if(k==='ArrowLeft'){e.preventDefault();seekTo(State.playhead-(e.shiftKey?1:0.1));}
     else if(k==='ArrowRight'){e.preventDefault();seekTo(State.playhead+(e.shiftKey?1:0.1));}
@@ -4615,7 +4828,7 @@ function collectEls(){
    'leftPanel','libBody','libTabs','libSearch','libContent','btnLeftCollapse','btnLeftExpand',
    'splitL','splitR','splitH','centerCol','previewPane','stageWrap','stage','previewCanvas',
    'btnPlay','timeCur','timeTot','progress','progFill','progKnob','btnMute','volSlider','ratioSel','qualSel','btnFull',
-   'timelineArea','btnSplit','btnDel','btnSnap','btnFit',
+   'timelineArea','btnSplit','btnDel','btnCopy','btnPaste','btnDup','btnSnap','btnFit',
    'btnZoomOut','zoomSlider','btnZoomIn','zoomLabel','tlBody','trackHeads','corner','headsInner',
    'tlWrap','tlCanvas','vScroll','vThumb','hScroll','hThumb',
    'rightPanel','propsBody','btnRightCollapse','btnRightExpand',
@@ -4695,6 +4908,7 @@ function init(){
   els.btnUser.addEventListener('click',function(e){e.stopPropagation();um.classList.toggle('open');});
   document.addEventListener('pointerdown',function(e){
     if(!um.contains(e.target)&&e.target!==els.btnUser&&!els.btnUser.contains(e.target))um.classList.remove('open');
+    if(els.ctxMenu&&els.ctxMenu.classList.contains('open')&&!els.ctxMenu.contains(e.target)&&e.target!==els.tlCanvas)hideCtxMenu();
   });
   // 移动端：侧面板抽屉（互斥）
   function closeDrawers(){els.leftPanel.classList.remove('open');els.rightPanel.classList.remove('open');}
@@ -4907,6 +5121,9 @@ function init(){
   // 时间线工具栏
   els.btnSplit.innerHTML=icon('scissors',15);
   els.btnDel.innerHTML=icon('trash',15);
+  els.btnCopy.innerHTML=icon('copy',15);
+  els.btnPaste.innerHTML=icon('paste',15);
+  els.btnDup.innerHTML=icon('duplicate',15);
   els.btnSnap.innerHTML=icon('magnet',15);
   els.btnFit.innerHTML=icon('fit',15);
   els.btnZoomOut.innerHTML=icon('zout',15);
@@ -4914,6 +5131,9 @@ function init(){
   els.btnSnap.classList.add('on');
   els.btnSplit.addEventListener('click',splitSelected);
   els.btnDel.addEventListener('click',deleteSelected);
+  els.btnCopy.addEventListener('click',copySelected);
+  els.btnPaste.addEventListener('click',function(){pasteClips(State.playhead);});
+  els.btnDup.addEventListener('click',duplicateSelected);
   els.btnSnap.addEventListener('click',function(){State.snap=!State.snap;els.btnSnap.classList.toggle('on',State.snap);});
   els.btnFit.addEventListener('click',function(){
     State.pps=clamp((els.tlWrap.clientWidth-60)/projectDuration(),2,240);
@@ -4995,7 +5215,9 @@ function init(){
   // 暴露调试 / 二期接入入口
   window.__EDITOR__={State:State,Engine:Engine,AIClient:AIClient,ProjectStore:ProjectStore,CloudSync:CloudSync,
     RenderCoordinator:window._renderCoord,DAGEngine:window.DAGEngine,
-    muxMp4FromChunks:muxMp4FromChunks,mockGenerateVideo:mockGenerateVideo,makeMockBGM:makeMockBGM,version:'0.2.0-phase2'};
+    muxMp4FromChunks:muxMp4FromChunks,mockGenerateVideo:mockGenerateVideo,makeMockBGM:makeMockBGM,
+    ops:{copy:copySelected,paste:pasteClips,duplicate:duplicateSelected,del:deleteSelected,split:splitSelected,selectAll:selectAllClips},
+    version:'0.3.0-studio'};
 }
 
 init();
