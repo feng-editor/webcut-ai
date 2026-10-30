@@ -35,7 +35,7 @@
  */
 
 // ============================================================
-// 内置节点定义（第一批：transform + color）
+// 内置节点定义（第一批：transform + color；第二批：blur + sharpen + chromaKey）
 // ============================================================
 const BUILTINS = {
 
@@ -44,13 +44,17 @@ const BUILTINS = {
     label: '变换',
     group: '变换',
     params: {
-      x:       { default: 0,   min: -100, max: 100, step: 1,    ui: 'slider', group: '变换', interpolate: 'linear' },
-      y:       { default: 0,   min: -100, max: 100, step: 1,    ui: 'slider', group: '变换', interpolate: 'linear' },
-      scale:   { default: 100, min: 10,   max: 300, step: 1,    ui: 'slider', group: '变换', interpolate: 'linear' },
-      rotation:{ default: 0,   min: -180, max: 180, step: 1,    ui: 'slider', group: '变换', interpolate: 'linear' },
-      opacity: { default: 100, min: 0,    max: 100, step: 1,    ui: 'slider', group: '变换', interpolate: 'linear' },
+      x:       { default: 0,   min: -100, max: 100, step: 1,    ui: 'slider', label: '位置 X', group: '变换', interpolate: 'linear' },
+      y:       { default: 0,   min: -100, max: 100, step: 1,    ui: 'slider', label: '位置 Y', group: '变换', interpolate: 'linear' },
+      scale:   { default: 100, min: 10,   max: 300, step: 1,    ui: 'slider', label: '缩放', group: '变换', interpolate: 'linear' },
+      rotation:{ default: 0,   min: -180, max: 180, step: 1,    ui: 'slider', label: '旋转', group: '变换', interpolate: 'linear' },
+      opacity: { default: 100, min: 0,    max: 100, step: 1,    ui: 'slider', label: '不透明度', group: '变换', interpolate: 'linear' },
+      cropL:   { default: 0,   min: 0,    max: 45,  step: 0.5,  ui: 'slider', label: '裁剪 左', group: '变换', interpolate: 'linear' },
+      cropR:   { default: 0,   min: 0,    max: 45,  step: 0.5,  ui: 'slider', label: '裁剪 右', group: '变换', interpolate: 'linear' },
+      cropT:   { default: 0,   min: 0,    max: 45,  step: 0.5,  ui: 'slider', label: '裁剪 上', group: '变换', interpolate: 'linear' },
+      cropB:   { default: 0,   min: 0,    max: 45,  step: 0.5,  ui: 'slider', label: '裁剪 下', group: '变换', interpolate: 'linear' },
       anchor:  { default: 'center',
-                 ui: 'select', group: '变换', interpolate: 'step',
+                 ui: 'select', label: '锚点', group: '变换', interpolate: 'step',
                  options: [
                    { value: 'center', label: '中心' },
                    { value: 'topLeft', label: '左上' },
@@ -60,7 +64,7 @@ const BUILTINS = {
                  ]}
     },
 
-    // Worker 内求值：接收采样后的参数，输出 uniform 值
+    // Worker 内求值：接收采样后的参数，输出 uniform 值（裁剪在 CPU 管线处理，不进 GPU uniform）
     evaluateFn(params) {
       return {
         uTransform: buildMat4(params),
@@ -74,14 +78,16 @@ const BUILTINS = {
     label: '调色',
     group: '调色',
     params: {
-      brightness: { default: 0,  min: -100, max: 100, step: 1, ui: 'slider', group: '调色', interpolate: 'linear' },
-      contrast:   { default: 0,  min: -100, max: 100, step: 1, ui: 'slider', group: '调色', interpolate: 'linear' },
-      saturation: { default: 0,  min: -100, max: 100, step: 1, ui: 'slider', group: '调色', interpolate: 'linear' },
-      temperature:{ default: 0,  min: -100, max: 100, step: 1, ui: 'slider', group: '调色', interpolate: 'linear' },
-      tint:       { default: 0,  min: -100, max: 100, step: 1, ui: 'slider', group: '调色', interpolate: 'linear' },
-      hueRotate:  { default: 0,  min: -180, max: 180, step: 1, ui: 'slider', group: '调色', interpolate: 'linear' },
+      brightness: { default: 0,  min: -100, max: 100, step: 1, ui: 'slider', label: '亮度', group: '调色', interpolate: 'linear' },
+      contrast:   { default: 0,  min: -100, max: 100, step: 1, ui: 'slider', label: '对比度', group: '调色', interpolate: 'linear' },
+      saturation: { default: 0,  min: -100, max: 100, step: 1, ui: 'slider', label: '饱和度', group: '调色', interpolate: 'linear' },
+      temperature:{ default: 0,  min: -100, max: 100, step: 1, ui: 'slider', label: '色温', group: '调色', interpolate: 'linear' },
+      tint:       { default: 0,  min: -100, max: 100, step: 1, ui: 'slider', label: '色调', group: '调色', interpolate: 'linear' },
+      hueRotate:  { default: 0,  min: -180, max: 180, step: 1, ui: 'slider', label: '色相旋转', group: '调色', interpolate: 'linear' },
+      highlights: { default: 0,  min: -100, max: 100, step: 1, ui: 'slider', label: '高光', group: '调色', interpolate: 'linear' },
+      shadows:    { default: 0,  min: -100, max: 100, step: 1, ui: 'slider', label: '阴影', group: '调色', interpolate: 'linear' },
       filterPreset: { default: 'none',
-                 ui: 'select', group: '调色', interpolate: 'step',
+                 ui: 'select', label: '风格预设', group: '调色', interpolate: 'step',
                  options: [
                    { value: 'none', label: '无' },
                    { value: 'warm', label: '暖色' },
@@ -111,8 +117,61 @@ const BUILTINS = {
         ]
       };
     }
+  },
+
+  blur: {
+    type: 'blur',
+    label: '模糊',
+    group: '效果',
+    params: {
+      blur: { default: 0, min: 0, max: 20, step: 0.5, ui: 'slider', label: '模糊半径', group: '效果', interpolate: 'linear' }
+    },
+    evaluateFn(params) {
+      // GPU 端高斯模糊半径（像素，随渲染尺寸缩放由 shader 内部处理）
+      return { uBlur: params.blur ?? 0 };
+    }
+  },
+
+  sharpen: {
+    type: 'sharpen',
+    label: '锐化',
+    group: '效果',
+    params: {
+      sharpen: { default: 0, min: 0, max: 100, step: 1, ui: 'slider', label: '锐化强度', group: '效果', interpolate: 'linear' }
+    },
+    evaluateFn(params) {
+      return { uSharpen: (params.sharpen ?? 0) / 100 };
+    }
+  },
+
+  chromaKey: {
+    type: 'chromaKey',
+    label: '色度键抠像',
+    group: '抠像',
+    params: {
+      ckEnabled:    { default: false, ui: 'checkbox', label: '启用色度键', group: '抠像', interpolate: 'step' },
+      ckColor:      { default: '#00d152', ui: 'color', label: '键控颜色', group: '抠像', interpolate: 'rgba' },
+      ckSimilarity: { default: 30, min: 0, max: 100, step: 1, ui: 'slider', label: '相似度', group: '抠像', interpolate: 'linear' },
+      ckSmoothness: { default: 20, min: 0, max: 100, step: 1, ui: 'slider', label: '边缘平滑', group: '抠像', interpolate: 'linear' }
+    },
+    evaluateFn(params) {
+      const c = hexToRgb(params.ckColor || '#00d152');
+      return {
+        uChromaEnabled: params.ckEnabled ? 1 : 0,
+        uKeyColor: [c.r / 255, c.g / 255, c.b / 255],
+        uChromaSim: (params.ckSimilarity ?? 30) / 100,
+        uChromaSmooth: Math.max(0.001, (params.ckSmoothness ?? 20) / 100)
+      };
+    }
   }
 };
+
+function hexToRgb(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex || '');
+  if (!m) return { r: 0, g: 209, b: 82 };
+  const n = parseInt(m[1], 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
 
 // ============================================================
 // 工具函数
@@ -231,7 +290,7 @@ class NodeRegistry {
     for (const [key, paramDef] of Object.entries(def.params)) {
       controls.push({
         key,
-        label: key, // 可扩展为中文映射
+        label: paramDef.label || key,
         ui: paramDef.ui || 'slider',
         min: paramDef.min,
         max: paramDef.max,
