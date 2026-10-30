@@ -696,11 +696,24 @@ def cloud_usage():
 # ============================================================
 # 静态文件（编辑器前端）—— 含路径遍历防护
 # ============================================================
+# 静态服务敏感路径黑名单：后端配置/数据/代码/临时目录绝不通过静态服务暴露
+_STATIC_DENY = ('ai-backend', '.git', '.zcode', 'node_modules')
+_STATIC_DENY_EXT = ('.env', '.py', '.json', '.md', '.tar.gz', '.yml', '.yaml',
+                    '.toml', '.db', '.sqlite', '.log', '.bat', '.sh', '.ps1')
+
 @app.route('/', defaults={'path': 'index.html'})
 @app.route('/<path:path>')
 def serve_static(path):
     # 路径遍历防护：拒绝 .. 、反斜杠、空字节；解析后必须在 ROOT 内
     if '..' in path or '\\' in path or '\x00' in path:
+        return jsonify({'error': 'not found'}), 404
+    norm = path.replace('\\', '/')
+    parts = [p for p in norm.split('/') if p]
+    # 首段目录黑名单（ai-backend/.git 等）与敏感扩展名黑名单
+    if parts and parts[0].lower() in _STATIC_DENY:
+        return jsonify({'error': 'not found'}), 404
+    low = norm.lower()
+    if any(low.endswith(ext) for ext in _STATIC_DENY_EXT):
         return jsonify({'error': 'not found'}), 404
     fpath = os.path.abspath(os.path.join(ROOT, path))
     # 双重校验：abspath 前缀 + realpath（防符号链接逃逸）
