@@ -2101,6 +2101,52 @@ var PayClient=(function(){
 var ProjectStore=(function(){
   var DB='webcut',KV='kv',MEDIA='media',dbp=null;
   var savedMedia={},saveTimer=null,noSave=false;
+  /* ---------- 多项目管理：'project-index' 存清单，'project:<id>' 存各项目，滚动保留 5 个版本 ---------- */
+  var VERSIONS=5;
+  function currentPid(){
+    var id=null;
+    try{id=localStorage.getItem('webcut_pid');}catch(e){}
+    if(!id){id='p-'+Date.now().toString(36)+'-'+(Math.random()*1e6|0).toString(36);
+      try{localStorage.setItem('webcut_pid',id);}catch(e){}}
+    return id;
+  }
+  function updateIndex(rec,removedId){
+    return get(KV,'project-index').then(function(idx){
+      idx=idx||[];
+      if(removedId)idx=idx.filter(function(x){return x.id!==removedId;});
+      else{
+        var it={id:currentPid(),name:rec.name||'未命名项目',updatedAt:rec.updatedAt||Date.now(),
+          clipCount:(rec.clips||[]).length,duration:(rec.clips||[]).reduce(function(m,c){return Math.max(m,(c.start||0)+(c.duration||0));},0)};
+        var found=false;
+        idx=idx.map(function(x){if(x.id===it.id){found=true;return it;}return x;});
+        if(!found)idx.unshift(it);
+      }
+      return put(KV,'project-index',idx).then(function(){return idx;});
+    });
+  }
+  function listProjects(){return get(KV,'project-index').then(function(x){return x||[];});}
+  function loadProject(id){
+    return get(KV,'project:'+id).then(function(rec){
+      if(!rec)throw new Error('项目数据不存在');
+      try{localStorage.setItem('webcut_pid',id);}catch(e){}
+      return rec;
+    });
+  }
+  function renameProject(id,name){
+    return get(KV,'project-index').then(function(idx){
+      idx=idx||[];
+      idx=idx.map(function(x){if(x.id===id)x.name=name;return x;});
+      return put(KV,'project-index',idx);
+    });
+  }
+  function deleteProject(id){
+    var ps=[get(KV,'project-index').then(function(idx){
+      idx=(idx||[]).filter(function(x){return x.id!==id;});
+      return put(KV,'project-index',idx);
+    }),put(KV,'project:'+id,null)];
+    for(var v=0;v<VERSIONS;v++)ps.push(put(KV,'project:'+id+':v'+v,null));
+    return Promise.all(ps);
+  }
   function open(){
     if(dbp)return dbp;
     dbp=new Promise(function(res,rej){
@@ -2173,7 +2219,17 @@ var ProjectStore=(function(){
   function saveNow(){
     if(noSave)return Promise.resolve(false); // 重置流程已清库，禁止回写
     var snap=snapshot(),kvRec=snap.rec,media=snap.media;
-    var ps=[put(KV,'project',kvRec)];
+    var pid=currentPid();
+    var ps=[put(KV,'project',kvRec),put(KV,'project:'+pid,kvRec)];
+    // 版本快照：滚动覆盖写 v0..v4（当前结构 + 最近 4 个历史版）
+    for(var v=VERSIONS-1;v>0;v--){
+      (function(slot){
+        ps.push(get(KV,'project:'+pid+':v'+(slot-1)).then(function(prev){
+          if(prev)return put(KV,'project:'+pid+':v'+slot,prev);
+        }));
+      })(v);
+    }
+    ps.push(put(KV,'project:'+pid+':v0',kvRec));
     Object.keys(media).forEach(function(sid){
       if(savedMedia[sid]||!media[sid])return; // 媒体本体只写一次，避免大文件反复入库
       var m=media[sid];
@@ -2182,6 +2238,7 @@ var ProjectStore=(function(){
         audioPcm:m.audioPcm,audioSr:m.audioSr}));
       savedMedia[sid]=1;
     });
+    ps.push(updateIndex(kvRec));
     return Promise.all(ps).then(function(){
       markSaved('已保存');
       try{localStorage.setItem('webcut_saved_at',String(kvRec.updatedAt));}catch(e){}
@@ -2278,12 +2335,42 @@ var ProjectStore=(function(){
   }
   function wipe(){ // Logo 重置：清空存档；置 noSave 防止 beforeunload 把内存工程回写
     noSave=true;
+    try{localStorage.removeItem('webcut_pid');}catch(e){}
     if(saveTimer){clearTimeout(saveTimer);saveTimer=null;}
     savedMedia={};
     return Promise.all([clear(KV),clear(MEDIA)]).catch(function(){});
   }
   var onSaveCb=null;
   return {saveNow:saveNow,schedule:schedule,restore:restore,wipe:wipe,
+    listProjects:listProjects,loadProject:loadProject,renameProject:renameProject,deleteProject:deleteProject,
+    currentPid:currentPid,getKV:function(store,key){return get(store,key);},
+    exportJSON:function(){
+      return get(KV,'project:'+currentPid()).then(function(rec){
+        if(!rec)throw new Error('当前没有已保存的工程');
+        var blob=new Blob([JSON.stringify(rec,null,1)],{type:'application/json'});
+        var a=document.createElement('a');
+        a.href=URL.createObjectURL(blob);
+        a.download=((rec.name||'工程')+'-'+new Date(rec.updatedAt||Date.now()).toISOString().slice(0,10)+'.webcut.json').replace(/[\\/:*?"<>|]/g,'');
+        document.body.appendChild(a);a.click();a.remove();
+        setTimeout(function(){URL.revokeObjectURL(a.href);},4000);
+        return true;
+      });
+    },
+    importJSON:function(file){
+      return file.text().then(function(txt){
+        var rec=JSON.parse(txt);
+        if(!rec||!Array.isArray(rec.clips)||!Array.isArray(rec.tracks))throw new Error('不是有效的 WebCut 工程文件');
+        try{localStorage.setItem('webcut_pid',currentPid());}catch(e){}
+        var hasMedia=Object.keys(rec.mediaMeta||{}).length;
+        rec.clips=rec.clips.map(function(c){if(c.sourceId)c._lostSource=true;return c;});
+        rec.clips=rec.clips.filter(function(c){return !c.sourceId;}); // 导入不含媒体本体：剔除媒体片段
+        return applyRecord(rec,function(){return Promise.resolve(null);}).then(function(ok){
+          saveNow();
+          if(hasMedia)toast('工程已导入（'+hasMedia+' 个素材引用的媒体需重新拖入后自动对位）');
+          return ok;
+        });
+      });
+    },
     snapshot:snapshot,applyRecord:applyRecord,pcmToBuffer:pcmToBuffer,
     savedAt:function(){return +localStorage.getItem('webcut_saved_at')||0;},
     cloudAt:function(){return +localStorage.getItem('webcut_cloud_at')||0;},
@@ -4659,6 +4746,110 @@ function openExportModal(){
     });
   });
 }
+/* ---------- 项目管理器：列表/打开/重命名/副本/删除/导入/导出 ---------- */
+function openProjectsModal(){
+  openModal('项目管理','<div id="pmLoading" class="ai-status">读取项目列表…</div><div class="pm-list" id="pmList"></div>'
+    +'<div class="m-actions"><button class="btn" id="pmImport">导入工程 JSON</button><button class="btn" id="pmExport">导出当前工程</button>'
+    +'<button class="btn" id="pmNew">新建项目</button><button class="btn primary" id="pmClose">关闭</button></div>',true);
+  var listEl=$id('pmList');
+  function render(){
+    ProjectStore.listProjects().then(function(items){
+      listEl.innerHTML='';
+      $id('pmLoading').style.display='none';
+      if(!items.length){listEl.appendChild(el('div','ai-status','还没有项目（当前工程保存后出现在这里）'));return;}
+      var cur=ProjectStore.currentPid();
+      items.sort(function(a,b){return (b.updatedAt||0)-(a.updatedAt||0);});
+      items.forEach(function(it){
+        var row=el('div','pm-item'+(it.id===cur?' cur':''));
+        row.innerHTML='<div class="pm-icon">'+icon('film',16)+'</div>'
+          +'<div class="pm-meta"><div class="pm-name">'+esc(it.name||'未命名项目')+(it.id===cur?'（当前）':'')+'</div>'
+          +'<div class="pm-sub">'+new Date(it.updatedAt||Date.now()).toLocaleString()+' · '+it.clipCount+' 个片段 · '+fmt(it.duration||0)+'</div></div>'
+          +'<div class="pm-ops">'
+          +'<button class="thb" data-op="open" title="打开">'+icon('play',13)+'</button>'
+          +'<button class="thb" data-op="rename" title="重命名">'+icon('type',13)+'</button>'
+          +'<button class="thb" data-op="dup" title="创建副本">'+icon('duplicate',13)+'</button>'
+          +'<button class="thb" data-op="del" title="删除">'+icon('trash',13)+'</button></div>';
+        row.addEventListener('click',function(e){
+          var op=(e.target.closest('.thb')||{}).dataset?e.target.closest('.thb')?.dataset.op:null;
+          if(op==='open'){
+            if(it.id===cur){toast('该项目已是当前项目');return;}
+            ProjectStore.saveNow().then(function(){
+              return ProjectStore.loadProject(it.id).then(function(rec){
+                return ProjectStore.applyRecord(rec,function(sid){return ProjectStore.get('media',sid);});
+              }).then(function(){closeModal();});
+            }).catch(function(err){toast('打开失败：'+((err&&err.message)||err));});
+          }else if(op==='rename'){
+            var nm=prompt('新项目名称：',it.name||'');
+            if(nm&&nm.trim()){
+              State.projectName=nm.trim();
+              els.projName.textContent=nm.trim();
+              ProjectStore.renameProject(it.id,nm.trim()).then(function(){ProjectStore.schedule();render();});
+            }
+          }else if(op==='dup'){
+            ProjectStore.loadProject(it.id).then(function(rec){
+              var nid='p-'+Date.now().toString(36)+'-'+(Math.random()*1e6|0).toString(36);
+              rec.name=(rec.name||'项目')+' 副本';
+              rec.updatedAt=Date.now();
+              return ProjectStore.put('kv','project:'+nid,rec).then(function(){
+                return ProjectStore.listProjects().then(function(idx){
+                  idx.unshift({id:nid,name:rec.name,updatedAt:rec.updatedAt,clipCount:(rec.clips||[]).length,duration:0});
+                  return ProjectStore.put('kv','project-index',idx);
+                });
+              });
+            }).then(render).then(function(){toast('已创建副本');})
+              .catch(function(err){toast('副本创建失败：'+((err&&err.message)||err));});
+          }else if(op==='del'){
+            if(it.id===cur)return toast('不能删除当前打开的项目（可先切换到其他项目）');
+            if(confirm('确定删除项目「'+(it.name||'未命名')+'」？此操作不可恢复。')){
+              ProjectStore.deleteProject(it.id).then(render);
+            }
+          }else if(!op){
+            // 点击行 = 打开
+            if(it.id===cur){toast('该项目已是当前项目');return;}
+            ProjectStore.saveNow().then(function(){
+              return ProjectStore.loadProject(it.id).then(function(rec){
+                return ProjectStore.applyRecord(rec,function(sid){return ProjectStore.get('media',sid);});
+              }).then(function(){closeModal();});
+            }).catch(function(err){toast('打开失败：'+((err&&err.message)||err));});
+          }
+        });
+        listEl.appendChild(row);
+      });
+    }).catch(function(e){
+      $id('pmLoading').textContent='读取失败：'+((e&&e.message)||e);
+    });
+  }
+  $id('pmClose').addEventListener('click',closeModal);
+  $id('pmNew').addEventListener('click',function(){
+    if(!confirm('新建项目将保存当前项目并切换到空白工程。继续？'))return;
+    ProjectStore.saveNow().then(function(){
+      var pid=ProjectStore.currentPid();
+      try{localStorage.setItem('webcut_pid','p-'+Date.now().toString(36)+'-'+(Math.random()*1e6|0).toString(36));}catch(e){}
+      State.projectName='未命名项目';
+      els.projName.textContent='未命名项目';
+      beginChange();
+      seed();State.selection=null;State.multiSel=[];State.playhead=0;
+      endChange();
+      renderHeaders();renderProps();requestRender();closeModal();
+      toast('已新建项目（媒体库素材仍在，可继续使用）');
+    });
+  });
+  $id('pmExport').addEventListener('click',function(){
+    ProjectStore.exportJSON().then(function(){toast('工程 JSON 已开始下载');})
+      .catch(function(e){toast('导出失败：'+((e&&e.message)||e));});
+  });
+  $id('pmImport').addEventListener('click',function(){
+    var inp=document.createElement('input');inp.type='file';inp.accept='.json,application/json';
+    inp.onchange=function(){
+      var f=inp.files[0];if(!f)return;
+      ProjectStore.importJSON(f).then(function(){closeModal();})
+        .catch(function(e){toast('导入失败：'+((e&&e.message)||e));});
+    };
+    inp.click();
+  });
+  render();
+}
+
 /* ---------- 设置 / 个人中心（头像下拉入口） ---------- */
 function openSettingsModal(){
   openModal('设置',
@@ -5647,7 +5838,7 @@ function init(){
   });
   // 头像下拉：个人中心 / 设置 / 退出登录
   var um=els.userMenu;
-  [['个人中心','user',openProfileModal],['设置','settings',openSettingsModal],['退出登录','logout',function(){
+  [['项目管理','layers',openProjectsModal],['个人中心','user',openProfileModal],['设置','settings',openSettingsModal],['退出登录','logout',function(){
     openModal('退出登录','<div class="m-note">当前为演示环境（无账号体系），退出后将回到初始状态。</div>'
       +'<div class="m-actions"><button class="btn" id="loNo">取消</button><button class="btn primary" id="loYes">退出</button></div>');
     $id('loNo').addEventListener('click',closeModal);
@@ -5746,14 +5937,10 @@ function init(){
   var isMobile=window.matchMedia('(max-width: 768px)').matches;
   State.isMobile=isMobile;
 
-  if(isMobile){
-    // 底部导航显示
-    els.bottomNav.style.display='flex';
-    // 隐藏桌面端的侧面板切换按钮
-    if(els.btnPanelL)els.btnPanelL.style.display='none';
-    if(els.btnPanelR)els.btnPanelR.style.display='none';
-
-    // —— 底部抽屉逻辑（互斥打开） ——
+  /* —— 底部导航 + 抽屉 + 触摸手势：无条件绑定（CSS 控制可见性）。
+     桌面加载→窗口缩窄/分屏时同样可用（isMobile 只影响一次性布局决策） —— */
+  {
+    // 底部抽屉逻辑（互斥打开）
     function closeAllSheets(){
       document.querySelectorAll('.mobile-sheet').forEach(function(s){s.classList.remove('open');});
     }
@@ -5859,12 +6046,18 @@ function init(){
       lastTapTime=now;
     });
 
-    // 预览区：竖屏时自动切 9:16
-    if(window.innerHeight>window.innerWidth){
+    // 预览区：初始即为竖屏视口时自动切 9:16（移动设备首载）
+    if(isMobile&&window.innerHeight>window.innerWidth){
       State.ratio='9:16';
       els.ratioSel.value='9:16';
       layoutStage();
     }
+  }
+  if(isMobile){
+    // 底部导航显示 + 隐藏桌面侧板切换按钮（仅移动设备首载的布局决策）
+    els.bottomNav.style.display='flex';
+    if(els.btnPanelL)els.btnPanelL.style.display='none';
+    if(els.btnPanelR)els.btnPanelR.style.display='none';
   }
 
   // 云同步：本地保存成功后自动推送云端（结构每次全量，媒体每个源只传一次；无后端时静默停用）
