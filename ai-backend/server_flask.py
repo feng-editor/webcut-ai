@@ -55,6 +55,9 @@ def cfg(name, default=''):
 KEY = cfg('DASHSCOPE_API_KEY')
 DASHSCOPE_BASE = cfg('DASHSCOPE_BASE_URL', 'https://dashscope.aliyuncs.com')
 WANX_MODEL = cfg('AI_VIDEO_MODEL', 'wanx2.1-t2v-plus')
+WANX_I2V_MODEL = cfg('AI_I2V_MODEL', 'wanx2.1-i2v-plus')
+WANX_T2I_MODEL = cfg('AI_T2I_MODEL', 'wanx2.1-t2i-turbo')
+QWEN_MODEL = cfg('AI_TEXT_MODEL', 'qwen-plus')
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 TMP = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'tmp')
@@ -83,6 +86,8 @@ def health():
     return jsonify({
         'available': True,
         'video': bool(KEY),
+        'image': bool(KEY),
+        'prompt': bool(KEY),
         'tts': True,
         'provider': 'dashscope-wanx+cosyvoice' if KEY else 'local-demo',
         'payments': {'alipay': False, 'demo': True}
@@ -109,6 +114,12 @@ def create_video_task():
         if not KEY:
             return jsonify({'error': '未配置 DASHSCOPE_API_KEY'}), 501
 
+        # 图生视频：请求带 image（data URL 或公网 URL）时走 i2v 模型
+        image_ref = (data.get('image') or '').strip()
+        is_i2v = bool(image_ref)
+        if is_i2v and not (image_ref.startswith('data:image/') or image_ref.startswith('http://') or image_ref.startswith('https://')):
+            return jsonify({'error': 'image 需为 data:image/... Base64 或公网 URL'}), 400
+
         # 调用阿里云万相 API
         url = DASHSCOPE_BASE + '/api/v1/services/aigc/video-generation/video-synthesis'
         headers = {
@@ -116,9 +127,13 @@ def create_video_task():
             'Content-Type': 'application/json',
             'X-DashScope-Async': 'enable'
         }
+        model = WANX_I2V_MODEL if is_i2v else WANX_MODEL
+        inp = {'prompt': prompt}
+        if is_i2v:
+            inp['img_url'] = image_ref
         payload = {
-            'model': WANX_MODEL,
-            'input': {'prompt': prompt},
+            'model': model,
+            'input': inp,
             'parameters': {'size': '960*960', 'duration': duration}
         }
 
@@ -211,6 +226,184 @@ def get_video_status(task_id):
             'error': t['error'],
             'url': ('/ai-media/' + t['video_file']) if t.get('video_file') else None
         })
+
+
+@app.route('/api/ai/task/<task_id>', methods=['GET'])
+def get_task_status_alias(task_id):
+    return get_video_status(task_id)
+
+
+@app.route('/api/ai/task/<task_id>', methods=['DELETE'])
+def cancel_task_alias(task_id):
+    return cancel_video_task(task_id)
+
+
+@app.route('/api/ai/video/<task_id>', methods=['DELETE'])
+def cancel_video_task(task_id):
+    """取消本地任务：置 canceled 并尽力取消 DashScope 侧任务（已完成的不可取消，返回真实状态）"""
+    with TASKS_LOCK:
+        t = TASKS.get(task_id)
+        if not t:
+            return jsonify({'error': '任务不存在'}), 404
+    ptid = t.get('provider_task_id')
+    if ptid and KEY:
+        try:
+            req_lib.post(DASHSCOPE_BASE + '/api/v1/tasks/' + ptid + '/cancel',
+                         headers={'Authorization': 'Bearer ' + KEY}, timeout=10)
+        except Exception:
+            pass  # 上游取消失败不影响本地标记；本地轮询照常结束
+    with TASKS_LOCK:
+        if t['status'] == 'running':
+            t['status'] = 'canceled'
+            t['stage'] = '已取消'
+    return jsonify({'ok': True, 'status': t['status']})
+
+
+# ============================================================
+# AI 图片生成（万相文生图）
+# ============================================================
+T2I_SIZES = {'1:1': '1024*1024', '16:9': '1280*720', '9:16': '720*1280', '4:3': '1024*768', '3:4': '768*1024'}
+
+@app.route('/api/ai/image', methods=['POST'])
+def create_image_task():
+    print('>>> [T2I] 收到图片生成请求 <<<', flush=True)
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        prompt = (data.get('prompt') or '').strip()
+        ratio = data.get('ratio') or '1:1'
+        if not prompt:
+            return jsonify({'error': 'prompt 不能为空'}), 400
+        if not KEY:
+            return jsonify({'error': '未配置 DASHSCOPE_API_KEY'}), 501
+        size = T2I_SIZES.get(ratio, '1024*1024')
+
+        url = DASHSCOPE_BASE + '/api/v1/services/aigc/text2image/image-synthesis'
+        headers = {
+            'Authorization': 'Bearer ' + KEY,
+            'Content-Type': 'application/json',
+            'X-DashScope-Async': 'enable'
+        }
+        payload = {'model': WANX_T2I_MODEL, 'input': {'prompt': prompt},
+                   'parameters': {'size': size, 'n': 1}}
+        resp = req_lib.post(url, headers=headers, json=payload, timeout=30)
+        print(f'>>> [T2I] 阿里云返回: {resp.status_code} <<<', flush=True)
+        if resp.status_code != 200:
+            return jsonify({'error': f'阿里云返回 {resp.status_code}: {resp.text[:200]}'}), 502
+        task_id = (resp.json().get('output') or {}).get('task_id')
+        if not task_id:
+            return jsonify({'error': '未返回 task_id'}), 502
+
+        local_id = str(uuid.uuid4())
+        with TASKS_LOCK:
+            TASKS[local_id] = {'id': local_id, 'status': 'running', 'progress': 0.1,
+                               'stage': '生成中', 'provider_task_id': task_id,
+                               'video_file': None, 'error': None}
+
+        def poll():
+            try:
+                for _ in range(60):  # 图片生成一般 <2 分钟
+                    time.sleep(3)
+                    pr = req_lib.get(DASHSCOPE_BASE + '/api/v1/tasks/' + task_id,
+                                     headers={'Authorization': 'Bearer ' + KEY}, timeout=15)
+                    if pr.status_code != 200:
+                        continue
+                    out = (pr.json().get('output') or {})
+                    status = out.get('task_status', '')
+                    with TASKS_LOCK:
+                        t = TASKS.get(local_id)
+                        if not t or t['status'] == 'canceled':
+                            return
+                        t['progress'] = 0.7 if status == 'RUNNING' else t['progress']
+                    if status == 'SUCCEEDED':
+                        results = out.get('results') or []
+                        img_url = (results[0] or {}).get('url') if results else None
+                        if img_url:
+                            ir = req_lib.get(img_url, timeout=60)
+                            if ir.status_code == 200:
+                                fname = str(uuid.uuid4()) + '.png'
+                                with open(os.path.join(TMP, fname), 'wb') as f:
+                                    f.write(ir.content)
+                                with TASKS_LOCK:
+                                    t = TASKS.get(local_id)
+                                    if t:
+                                        t['video_file'] = fname  # 复用 video_file 字段存产物文件名
+                                        t['status'] = 'done'
+                                        t['progress'] = 1.0
+                                return
+                        with TASKS_LOCK:
+                            t = TASKS.get(local_id)
+                            if t:
+                                t['status'] = 'failed'
+                                t['error'] = '结果下载失败'
+                        return
+                    elif status == 'FAILED':
+                        with TASKS_LOCK:
+                            t = TASKS.get(local_id)
+                            if t:
+                                t['status'] = 'failed'
+                                t['error'] = f"生成失败: {out.get('message', '未知原因')}"
+                        return
+                with TASKS_LOCK:
+                    t = TASKS.get(local_id)
+                    if t and t['status'] == 'running':
+                        t['status'] = 'failed'
+                        t['error'] = '生成超时'
+            except Exception as e:
+                with TASKS_LOCK:
+                    t = TASKS.get(local_id)
+                    if t:
+                        t['status'] = 'failed'
+                        t['error'] = str(e)
+
+        threading.Thread(target=poll, daemon=True).start()
+        return jsonify({'taskId': local_id})
+
+    except Exception as e:
+        print(f'!!!! [T2I] 异常: {e} !!!!', flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================
+# AI 创意辅助（Qwen 提示词润色，同步返回）
+# ============================================================
+@app.route('/api/ai/prompt', methods=['POST'])
+def enhance_prompt():
+    print('>>> [QWEN] 收到提示词润色请求 <<<', flush=True)
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        prompt = (data.get('prompt') or '').strip()
+        kind = data.get('kind') or 'video'  # video | image
+        if not prompt:
+            return jsonify({'error': 'prompt 不能为空'}), 400
+        if not KEY:
+            return jsonify({'error': '未配置 DASHSCOPE_API_KEY'}), 501
+
+        sysmsg = ('你是短视频与AI绘画提示词专家。把用户的简短想法扩写成一段中文视频生成提示词：'
+                  '包含主体、场景、镜头运动、光线、氛围、风格。只输出提示词本身，80字以内。') \
+            if kind == 'video' else \
+            ('你是AI绘画提示词专家。把用户的简短想法扩写成一段中文图片生成提示词：'
+             '包含主体细节、构图、光线、色调、艺术风格。只输出提示词本身，60字以内。')
+        url = DASHSCOPE_BASE + '/api/v1/services/aigc/text-generation/generation'
+        headers = {'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json'}
+        payload = {
+            'model': QWEN_MODEL,
+            'input': {'messages': [
+                {'role': 'system', 'content': sysmsg},
+                {'role': 'user', 'content': prompt}
+            ]},
+            'parameters': {'result_format': 'message', 'max_tokens': 200}
+        }
+        resp = req_lib.post(url, headers=headers, json=payload, timeout=60)
+        if resp.status_code != 200:
+            return jsonify({'error': f'阿里云返回 {resp.status_code}: {resp.text[:200]}'}), 502
+        txt = (((resp.json().get('output') or {}).get('choices') or [{}])[0].get('message') or {}).get('content')
+        if not txt:
+            return jsonify({'error': '模型未返回内容'}), 502
+        return jsonify({'prompt': txt.strip()})
+
+    except Exception as e:
+        print(f'!!!! [QWEN] 异常: {e} !!!!', flush=True)
+        return jsonify({'error': str(e)}), 500
 
 
 # ============================================================

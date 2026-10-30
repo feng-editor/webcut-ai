@@ -3684,9 +3684,11 @@ function toast(msg){
   els.toasts.appendChild(t);
   setTimeout(function(){t.classList.add('out');setTimeout(function(){t.remove();},300);},2400);
 }
-function openModal(title,html){
+function openModal(title,html,wide){
   els.modalTitle.textContent=title;
   els.modalBody.innerHTML=html;
+  els.modal.classList.toggle('wide',!!wide);
+  els.modal.classList.remove('xl');
   els.modalMask.classList.add('open');
 }
 function closeModal(){els.modalMask.classList.remove('open');}
@@ -4684,36 +4686,460 @@ function aiHideError(){
   var b=$id('aiErr');
   if(b){b.classList.remove('on');b.innerHTML='';}
 }
+/* ============================================================
+   AI 创作中心：10 项功能的独立工作区（真实状态标注）
+   live=已接入真实处理 dev=依赖未就绪（如实标注，不伪装）
+   ============================================================ */
+var AI_FUNCS=[
+  {key:'t2v',cat:'视频生成',name:'AI 文生视频',ic:'sparkles',state:'live',desc:'输入文字描述，通义万相生成短视频片段'},
+  {key:'i2v',cat:'视频生成',name:'AI 图生视频',ic:'camera',state:'live',desc:'上传一张图片作为首帧，AI 让它动起来'},
+  {key:'t2i',cat:'图片生成',name:'AI 图片生成',ic:'image',state:'live',desc:'文字生成图片素材，可直接加入时间线'},
+  {key:'tts',cat:'音频创作',name:'AI 配音',ic:'mic',state:'live',desc:'CosyVoice 文本转语音，自动铺入音频轨'},
+  {key:'ck',cat:'智能处理',name:'AI 智能抠像',ic:'wand',state:'live',desc:'色度键抠除纯色背景（绿幕/蓝幕），GPU 着色器实时预览'},
+  {key:'enhance',cat:'智能处理',name:'AI 视频增强',ic:'layers',state:'live',desc:'一键锐化+对比度增强（真实处理管线）；AI 超分开发中'},
+  {key:'style',cat:'智能处理',name:'AI 风格转换',ic:'film',state:'live',desc:'调色风格预设（怀旧/赛博朋克等）；神经风格迁移开发中'},
+  {key:'sub',cat:'智能处理',name:'AI 智能字幕',ic:'type',state:'dev',desc:'需接入语音识别（Paraformer ASR）服务后开放'},
+  {key:'bgrm',cat:'智能处理',name:'AI 背景移除',ic:'crop',state:'dev',desc:'需接入人像分割模型服务后开放'},
+  {key:'idea',cat:'创作辅助',name:'AI 创意辅助',ic:'smile',state:'live',desc:'Qwen 把你的简短想法扩写成专业提示词'}
+];
+var aiCenterTab='t2v';
+var aiJob={busy:false,cancelled:false,taskId:null,kind:null}; // 当前生成任务
+
+function aiPoll(url,onProgress,onDone,onFail){
+  // 轮询任务状态；返回 cancel 函数
+  var stop=false,timer=null;
+  function tick2(){
+    if(stop)return;
+    fetch(API_BASE+'/api/ai/task/'+aiJob.taskId).then(function(r){return r.json();}).then(function(j){
+      if(stop)return;
+      if(j.error){onFail(j.error);return;}
+      onProgress(j);
+      if(j.status==='done'){
+        if(j.url)fetch(API_BASE+j.url,{signal:AbortSignal.timeout(120000)})
+          .then(function(r){if(!r.ok)throw new Error('下载失败 HTTP '+r.status);return r.blob();})
+          .then(function(b){if(!stop)onDone(b);})
+          .catch(function(e){if(!stop)onFail('素材下载失败：'+((e&&e.message)||e));});
+      }else if(j.status==='failed'){onFail(j.error||'生成失败');}
+      else if(j.status==='canceled'){onFail('任务已取消');}
+      else{timer=setTimeout(tick2,3000);}
+    }).catch(function(e){if(!stop)onFail('网络错误：'+((e&&e.message)||e));});
+  }
+  timer=setTimeout(tick2,2500);
+  return function(){stop=true;if(timer)clearTimeout(timer);};
+}
+function aiJobStart(kind,taskId){
+  aiJob={busy:true,cancelled:false,taskId:taskId,kind:kind};
+}
+function aiJobCancel(){
+  if(!aiJob.busy||!aiJob.taskId)return Promise.resolve();
+  aiJob.cancelled=true;
+  return fetch(API_BASE+'/api/ai/task/'+aiJob.taskId,{method:'DELETE'}).catch(function(){});
+}
+function aiJobReset(){aiJob={busy:false,cancelled:false,taskId:null,kind:null};}
+
+function fileToDataURL(file){
+  return new Promise(function(res,rej){
+    var r=new FileReader();
+    r.onload=function(){res(r.result);};
+    r.onerror=rej;
+    r.readAsDataURL(file);
+  });
+}
+/* 生成结果落库：视频/图片/音频 blob → 素材库 → 直接上轨 */
+function aiResultToTimeline(blob,name,kind){
+  var file=new File([blob],name,{type:blob.type||'application/octet-stream'});
+  if(kind==='audio'){
+    return file.arrayBuffer().then(function(b){return Engine.audio.decode(b);})
+      .then(function(buf){addAudioBufferToTimeline(buf,name);});
+  }
+  return new Promise(function(resolve){
+    if(kind==='image'){
+      LIB_RAW.media.push({name:name,kind:'image',dur:'图片'});
+      buildLibMap();
+      var it=LIB_RAW.media[LIB_RAW.media.length-1];
+      createImageBitmap(file).then(function(bm){
+        var tc=document.createElement('canvas');tc.width=96;
+        tc.height=Math.max(2,Math.round(96*bm.height/bm.width));
+        tc.getContext('2d').drawImage(bm,0,0,tc.width,tc.height);
+        it.thumb=tc.toDataURL('image/jpeg',0.72);bm.close();
+        renderLibrary();
+        addClipFromLib(it,'video',State.playhead);
+        resolve();
+      }).catch(function(){
+        renderLibrary();
+        addClipFromLib(it,'video',State.playhead);
+        resolve();
+      });
+      return;
+    }
+    ingestVideoFile(file,name).then(function(r){
+      if(r&&r.item)addClipFromLib(r.item,'video',State.playhead);
+      resolve();
+    });
+  });
+}
+
 function openAIModal(){
-  AIClient.health().then(function(caps){
-    var chip=caps
-      ?(caps.video?'链路：云端 AI（通义万相 + CosyVoice）':'链路：后端 TTS 可用（视频生成需配置 Key）')
-      :'链路：云端 AI（通过代理连接后端服务器）';
-    openModal('AI 生成视频',
-      '<div class="ai-box">'
-      +'<textarea id="aiPrompt" placeholder="描述你想要的画面，例如：一只猫在太空漂浮，背景是星云…"></textarea>'
-      +'<div class="ai-row"><span class="ph-chip">'+chip+'</span>'
-      +'<div class="spacer"></div>'
-      +'<select class="ctl" id="aiDur"><option value="3">3 秒</option><option value="4" selected>4 秒</option><option value="5">5 秒</option></select></div>'
-      +'<div class="ai-prog" id="aiProg"><i id="aiProgBar"></i></div>'
-      +'<div class="ai-status" id="aiStatus">输入描述后点击「开始生成」</div>'
-      +'<div class="ai-err" id="aiErr"></div>'
-      +'<div class="m-actions"><button class="btn" id="aiClose">关闭</button><button class="btn primary" id="aiGo">'+icon('sparkles',13)+' 开始生成</button></div>'
-      +'</div>');
-    $id('aiGo').addEventListener('click',function(){
-      console.log('[WebCut AI] 「开始生成」按钮被点击');
-      var prompt=$id('aiPrompt').value.trim();
-      if(!prompt)return aiShowError('请先输入画面描述');
-      if(aiRun&&aiRun.busy)return;
-      runAIgeneration(prompt,+($id('aiDur').value||4),caps);
+  openModal('AI 创作中心','',true); // wide 模式；内容异步填充
+  var root=$id('modalBody');
+  root.innerHTML='<div class="aic"><div class="aic-nav" id="aicNav"></div><div class="aic-main" id="aicMain"></div></div>';
+  var nav=$id('aicNav'),main=$id('aicMain');
+  var lastCat='';
+  AI_FUNCS.forEach(function(f){
+    if(f.cat!==lastCat){nav.appendChild(el('div','aic-cat',f.cat));lastCat=f.cat;}
+    var it=el('div','aic-item'+(aiCenterTab===f.key?' active':''),
+      icon(f.ic,14)+'<span>'+f.name+'</span>'
+      +(f.state==='dev'?'<span class="dev">开发中</span>':''));
+    it.addEventListener('click',function(){
+      if(aiJob.busy&&!confirm('当前有生成任务进行中，切换将停止轮询（后端任务继续）。确定？'))return;
+      if(aiJob.busy)aiJobReset();
+      aiCenterTab=f.key;
+      Array.prototype.forEach.call(nav.children,function(x){x.classList.remove('active');});
+      it.classList.add('active');
+      renderAIFunc(main);
     });
-    $id('aiClose').addEventListener('click',function(){
-      if(aiRun&&aiRun.busy){
-        aiRun.cancelled=true;
-        if(aiRun.onCancel)aiRun.onCancel(); // 等待 TTS 重试时关闭：以配乐收尾，保证时间线完整
-      }
-      closeModal();
+    nav.appendChild(it);
+  });
+  renderAIFunc(main);
+}
+function aiHead(main,f){
+  main.innerHTML='<div class="aic-title">'+icon(f.ic,16)+f.name
+    +'<span class="aic-tag '+(f.state==='live'?'live':'dev')+'">'+(f.state==='live'?'可用':'开发中')+'</span></div>'
+    +'<div class="aic-desc">'+f.desc+'</div>';
+}
+function renderAIFunc(main){
+  var f=AI_FUNCS.find(function(x){return x.key===aiCenterTab;});
+  aiHead(main,f);
+  if(f.state==='dev'){
+    return (function(){
+      var note=el('div','aic-note','该功能依赖尚未接入的服务（'+(f.key==='sub'?'语音识别 ASR':'人像分割模型')+'）。'
+        +'为避免虚假功能，此处如实标注开发中，接入后即可开放。');
+      main.appendChild(note);
+    })();
+  }
+  var fn={t2v:aiPanelT2V,i2v:aiPanelI2V,t2i:aiPanelT2I,tts:aiPanelTTS,ck:aiPanelCK,
+    enhance:aiPanelEnhance,style:aiPanelStyle,idea:aiPanelIdea}[f.key];
+  if(fn)fn(main);
+}
+/* —— 公共表单件 —— */
+function aiForm(main){
+  var form=el('div','aic-form');main.appendChild(form);return form;
+}
+function aiProgress(main){
+  var prog=el('div','ai-prog','<i></i>');main.appendChild(prog);
+  var st=el('div','ai-status','就绪');main.appendChild(st);
+  var err=el('div','ai-err');main.appendChild(err);
+  var prev=el('div','aic-preview');prev.style.display='none';main.appendChild(prev);
+  var act=el('div','aic-actions');main.appendChild(act);
+  return {
+    prog:prog,bar:prog.firstChild,st:st,err:err,prev:prev,act:act,
+    show(p,txt){prog.classList.add('on');prog.firstChild.style.width=Math.round(clamp(p,0,1)*100)+'%';st.textContent=txt;},
+    hide(){prog.classList.remove('on');st.textContent='';},
+    fail(msg){this.hide();err.textContent=msg;err.classList.add('on');},
+    clearErr(){err.classList.remove('on');err.textContent='';},
+    preview(blob,isVideo){
+      prev.style.display='block';prev.innerHTML='';
+      if(isVideo){var v=document.createElement('video');v.src=URL.createObjectURL(blob);v.controls=true;prev.appendChild(v);}
+      else{var im=document.createElement('img');im.src=URL.createObjectURL(blob);prev.appendChild(im);}
+    },
+    actions(list){act.innerHTML='';list.forEach(function(a){
+      var b=el('button','btn'+(a.primary?' primary':''),a.icon?icon(a.icon,13)+' '+a.label:a.label);
+      b.addEventListener('click',a.fn);act.appendChild(b);
+    });}
+  };
+}
+/* —— 文生视频 —— */
+function aiPanelT2V(main){
+  var form=aiForm(main);
+  var ta=document.createElement('textarea');
+  ta.placeholder='描述你想要的画面，例如：一只橘猫在太空漂浮，背景是旋转的星云，电影感光效…';
+  form.appendChild(ta);
+  var row=el('div','aic-row');
+  var btnIdea=el('button','btn sm',icon('wand',12)+' AI 润色');
+  var dur=document.createElement('select');dur.className='ctl';
+  [[3,'3 秒'],[4,'4 秒'],[5,'5 秒']].forEach(function(o){var op=document.createElement('option');op.value=o[0];op.textContent=o[1];dur.appendChild(op);});
+  row.appendChild(btnIdea);row.appendChild(el('span','spacer'));
+  row.appendChild(el('span','field-label','时长'));row.appendChild(dur);
+  form.appendChild(row);
+  var ui=aiProgress(main);
+  btnIdea.addEventListener('click',function(){
+    var p=ta.value.trim();if(!p)return toast('请先输入想法');
+    btnIdea.disabled=true;btnIdea.textContent='润色中…';
+    fetch(API_BASE+'/api/ai/prompt',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt:p,kind:'video'}),signal:AbortSignal.timeout(65000)})
+      .then(function(r){return r.json().then(function(j){return {code:r.status,j:j};});})
+      .then(function(res){
+        if(res.code!==200)throw new Error(res.j.error||'润色失败');
+        ta.value=res.j.prompt;toast('已生成专业提示词');
+      })
+      .catch(function(e){toast('润色失败：'+((e&&e.message)||e));})
+      .then(function(){btnIdea.disabled=false;btnIdea.innerHTML=icon('wand',12)+' AI 润色';});
+  });
+  function start(){
+    var p=ta.value.trim();
+    if(!p)return ui.fail('请先输入画面描述');
+    if(aiJob.busy)return ui.fail('已有任务进行中，请先等待或取消');
+    ui.clearErr();ui.show(0.05,'提交任务中…');
+    fetch(API_BASE+'/api/ai/video',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt:p,duration:+dur.value}),signal:AbortSignal.timeout(30000)})
+      .then(function(r){return r.json().then(function(j){return {code:r.status,j:j};});})
+      .then(function(res){
+        if(res.code!==200)throw new Error(res.j.error||'任务创建失败');
+        aiJobStart('t2v',res.j.taskId);
+        ui.show(0.1,'已提交，万相生成中（约 1-3 分钟）…');
+        var stop=aiPoll(null,function(j){ui.show(j.progress||0.3,'生成中 '+(j.stage||'')+'…');},
+          function(blob){aiJobReset();ui.hide();ui.preview(blob,true);
+            ui.actions([
+              {label:'加入时间线',primary:true,icon:'plus',fn:function(){ui.actions([]);
+                aiResultToTimeline(blob,'AI生成 '+p.slice(0,8)+'.mp4','video').then(function(){toast('已加入时间线');closeModal();});}},
+              {label:'重新生成',fn:start}
+            ]);},
+          function(msg){aiJobReset();ui.fail(msg);
+            ui.actions([{label:'重试',primary:true,fn:start}]);});
+        ui.actions([{label:'取消任务',fn:function(){stop();aiJobCancel().then(function(){aiJobReset();ui.hide();ui.st.textContent='任务已取消';ui.actions([{label:'重新生成',fn:start}]);});}}]);
+      })
+      .catch(function(e){ui.hide();ui.fail('提交失败：'+((e&&e.message)||e));});
+  }
+  var go=el('button','btn primary',icon('sparkles',13)+' 开始生成');
+  go.style.marginTop='10px';
+  main.appendChild(go);
+  go.addEventListener('click',start);
+}
+/* —— 图生视频 —— */
+function aiPanelI2V(main){
+  var form=aiForm(main);
+  var imgData=null;
+  var pick=el('div','aic-row');
+  var fileBtn=el('button','btn',icon('image',13)+' 选择图片');
+  var fileName=el('span','field-label','未选择（JPG/PNG，建议 16:9 或 9:16）');
+  pick.appendChild(fileBtn);pick.appendChild(fileName);
+  form.appendChild(pick);
+  var ta=document.createElement('textarea');
+  ta.placeholder='（可选）描述运动方式：镜头缓缓推进，云层流动，光影变化…留空则自动运镜';
+  form.appendChild(ta);
+  var ui=aiProgress(main);
+  fileBtn.addEventListener('click',function(){
+    var inp=document.createElement('input');inp.type='file';inp.accept='image/*';
+    inp.onchange=function(){
+      var f=inp.files[0];if(!f)return;
+      if(f.size>8*1024*1024)return toast('图片请小于 8MB');
+      fileName.textContent=f.name+' ('+Math.round(f.size/1024)+'KB)';
+      fileToDataURL(f).then(function(d){imgData=d;});
+    };
+    inp.click();
+  });
+  function start(){
+    if(!imgData)return ui.fail('请先选择一张图片');
+    if(aiJob.busy)return ui.fail('已有任务进行中');
+    ui.clearErr();ui.show(0.05,'提交任务中…');
+    fetch(API_BASE+'/api/ai/video',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt:ta.value.trim()||'让画面自然地动起来，镜头平缓运动',duration:4,image:imgData}),
+      signal:AbortSignal.timeout(60000)})
+      .then(function(r){return r.json().then(function(j){return {code:r.status,j:j};});})
+      .then(function(res){
+        if(res.code!==200)throw new Error(res.j.error||'任务创建失败');
+        aiJobStart('i2v',res.j.taskId);
+        ui.show(0.1,'已提交，图生视频生成中…');
+        var stop=aiPoll(null,function(j){ui.show(j.progress||0.3,'生成中…');},
+          function(blob){aiJobReset();ui.hide();ui.preview(blob,true);
+            ui.actions([
+              {label:'加入时间线',primary:true,icon:'plus',fn:function(){ui.actions([]);
+                aiResultToTimeline(blob,'AI图生视频.mp4','video').then(function(){toast('已加入时间线');closeModal();});}},
+              {label:'重新生成',fn:start}
+            ]);},
+          function(msg){aiJobReset();ui.fail(msg);ui.actions([{label:'重试',primary:true,fn:start}]);});
+        ui.actions([{label:'取消任务',fn:function(){stop();aiJobCancel().then(function(){aiJobReset();ui.hide();ui.st.textContent='任务已取消';ui.actions([{label:'重新生成',fn:start}]);});}}]);
+      })
+      .catch(function(e){ui.hide();ui.fail('提交失败：'+((e&&e.message)||e)+'（图生视频需要有效 DashScope Key）');});
+  }
+  var go=el('button','btn primary',icon('sparkles',13)+' 开始生成');
+  go.style.marginTop='10px';main.appendChild(go);
+  go.addEventListener('click',start);
+}
+/* —— 文生图 —— */
+function aiPanelT2I(main){
+  var form=aiForm(main);
+  var ta=document.createElement('textarea');
+  ta.placeholder='描述画面：日落时分的赛博朋克城市，霓虹灯倒映在湿地，电影感构图…';
+  form.appendChild(ta);
+  var row=el('div','aic-row');
+  var btnIdea=el('button','btn sm',icon('wand',12)+' AI 润色');
+  var ratio=document.createElement('select');ratio.className='ctl';
+  [['1:1','1:1 方形'],['16:9','16:9 横屏'],['9:16','9:16 竖屏'],['4:3','4:3'],['3:4','3:4']].forEach(function(o){
+    var op=document.createElement('option');op.value=o[0];op.textContent=o[1];ratio.appendChild(op);});
+  row.appendChild(btnIdea);row.appendChild(el('span','spacer'));
+  row.appendChild(el('span','field-label','比例'));row.appendChild(ratio);
+  form.appendChild(row);
+  var ui=aiProgress(main);
+  btnIdea.addEventListener('click',function(){
+    var p=ta.value.trim();if(!p)return toast('请先输入想法');
+    btnIdea.disabled=true;btnIdea.textContent='润色中…';
+    fetch(API_BASE+'/api/ai/prompt',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt:p,kind:'image'}),signal:AbortSignal.timeout(65000)})
+      .then(function(r){return r.json().then(function(j){return {code:r.status,j:j};});})
+      .then(function(res){if(res.code!==200)throw new Error(res.j.error||'润色失败');ta.value=res.j.prompt;toast('已生成专业提示词');})
+      .catch(function(e){toast('润色失败：'+((e&&e.message)||e));})
+      .then(function(){btnIdea.disabled=false;btnIdea.innerHTML=icon('wand',12)+' AI 润色';});
+  });
+  function start(){
+    var p=ta.value.trim();
+    if(!p)return ui.fail('请先输入画面描述');
+    if(aiJob.busy)return ui.fail('已有任务进行中');
+    ui.clearErr();ui.show(0.05,'提交任务中…');
+    fetch(API_BASE+'/api/ai/image',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt:p,ratio:ratio.value}),signal:AbortSignal.timeout(30000)})
+      .then(function(r){return r.json().then(function(j){return {code:r.status,j:j};});})
+      .then(function(res){
+        if(res.code!==200)throw new Error(res.j.error||'任务创建失败');
+        aiJobStart('t2i',res.j.taskId);
+        ui.show(0.2,'已提交，图片生成中…');
+        var stop=aiPoll(null,function(j){ui.show(j.progress||0.5,'生成中…');},
+          function(blob){aiJobReset();ui.hide();ui.preview(blob,false);
+            ui.actions([
+              {label:'加入时间线（4 秒）',primary:true,icon:'plus',fn:function(){ui.actions([]);
+                aiResultToTimeline(blob,'AI图片 '+p.slice(0,8)+'.png','image').then(function(){toast('已加入时间线');closeModal();});}},
+              {label:'重新生成',fn:start}
+            ]);},
+          function(msg){aiJobReset();ui.fail(msg);ui.actions([{label:'重试',primary:true,fn:start}]);});
+        ui.actions([{label:'取消任务',fn:function(){stop();aiJobCancel().then(function(){aiJobReset();ui.hide();ui.st.textContent='任务已取消';ui.actions([{label:'重新生成',fn:start}]);});}}]);
+      })
+      .catch(function(e){ui.hide();ui.fail('提交失败：'+((e&&e.message)||e));});
+  }
+  var go=el('button','btn primary',icon('sparkles',13)+' 生成图片');
+  go.style.marginTop='10px';main.appendChild(go);
+  go.addEventListener('click',start);
+}
+/* —— AI 配音（CosyVoice，结果直接进音频轨） —— */
+function aiPanelTTS(main){
+  var form=aiForm(main);
+  var ta=document.createElement('textarea');
+  ta.placeholder='输入配音文案，例如：欢迎来到我的频道，今天我们聊聊…';
+  form.appendChild(ta);
+  var row=el('div','aic-row');
+  var sel=document.createElement('select');sel.className='ctl';
+  DUB_VOICES.forEach(function(v){var o=document.createElement('option');o.value=v[0];o.textContent=v[1];sel.appendChild(o);});
+  row.appendChild(el('span','field-label','音色'));row.appendChild(sel);
+  form.appendChild(row);
+  var st=el('div','ai-status','生成后自动铺入音频轨（当前播放头位置）');main.appendChild(st);
+  var err=el('div','ai-err');main.appendChild(err);
+  var go=el('button','btn primary',icon('mic',13)+' 生成配音');
+  go.style.marginTop='10px';main.appendChild(go);
+  go.addEventListener('click',function(){
+    var text=ta.value.trim();
+    if(!text){err.textContent='请先输入配音文案';err.classList.add('on');return;}
+    err.classList.remove('on');go.disabled=true;st.textContent='CosyVoice 合成中…';
+    fetch(API_BASE+'/api/ai/tts',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:text,voice:sel.value}),signal:AbortSignal.timeout(60000)})
+      .then(function(r){return r.json().then(function(j){return {code:r.status,j:j};});})
+      .then(function(res){
+        if(res.code!==200)throw new Error(res.j.error||'配音服务暂不可用');
+        st.textContent='下载音频中…';
+        return fetch(API_BASE+res.j.url,{signal:AbortSignal.timeout(120000)}).then(function(r2){return r2.arrayBuffer();});
+      })
+      .then(function(bytes){return Engine.audio.decode(bytes);})
+      .then(function(buf){
+        addAudioBufferToTimeline(buf,'AI配音：'+text.slice(0,10));
+        st.textContent='✓ 已生成 '+buf.duration.toFixed(1)+' 秒，已添加到音频轨';
+        toast('AI 配音已添加到时间线');
+      })
+      .catch(function(e){err.textContent='生成失败：'+((e&&e.message)||e)+'，可重试';err.classList.add('on');})
+      .then(function(){go.disabled=false;});
+  });
+}
+/* —— 智能抠像：引导式接入真实色度键 —— */
+function aiPanelCK(main){
+  var c=getSel();
+  if(!c){
+    var n0=el('div','aic-note','请先在时间线选中一个视频片段，再回到这里启用色度键。');
+    main.appendChild(n0);return;
+  }
+  var form=aiForm(main);
+  form.appendChild(el('div','field-label','已选中：'+esc(c.label)));
+  var row=el('div','aic-row');
+  var btnGreen=el('button','btn',icon('wand',13)+' 绿幕抠像');
+  var btnBlue=el('button','btn',icon('wand',13)+' 蓝幕抠像');
+  row.appendChild(btnGreen);row.appendChild(btnBlue);
+  form.appendChild(row);
+  main.appendChild(el('div','aic-note','色度键由 GPU 着色器实时预览，导出为逐像素真实处理。'
+    +'启用后可在右侧属性面板「色度键抠像」中调整键控颜色 / 相似度 / 边缘平滑。'));
+  function apply(color){
+    beginChange();setClipProp(c,'ckEnabled',true);setClipProp(c,'ckColor',color);endChange();
+    renderProps();requestPreviewDraw();
+    toast('色度键已启用（'+(color==='#00d152'?'绿幕':'蓝幕')+'），可在属性面板微调');
+    closeModal();
+  }
+  btnGreen.addEventListener('click',function(){apply('#00d152');});
+  btnBlue.addEventListener('click',function(){apply('#1f6fd1');});
+}
+/* —— 视频增强：真实属性管线 —— */
+function aiPanelEnhance(main){
+  var c=getSel();
+  if(!c){main.appendChild(el('div','aic-note','请先在时间线选中一个视频/图片片段。'));return;}
+  main.appendChild(el('div','aic-note','将对选中片段应用：锐化 +45、对比度 +12、亮度 +5（真实处理，可在属性面板撤销数值）。'));
+  var go=el('button','btn primary',icon('layers',13)+' 应用增强');
+  go.style.marginTop='10px';main.appendChild(go);
+  go.addEventListener('click',function(){
+    beginChange();
+    setClipProp(c,'sharpen',Math.min(100,(c.props.sharpen||0)+45));
+    setClipProp(c,'contrast',clamp((c.props.contrast||0)+12,-100,100));
+    setClipProp(c,'brightness',clamp((c.props.brightness||0)+5,-100,100));
+    endChange();renderProps();requestPreviewDraw();
+    toast('已应用增强（可继续在属性面板微调）');closeModal();
+  });
+  main.appendChild(el('div','aic-note','AI 超分辨率（4K 重建）依赖超分模型服务，开发中。'));
+}
+/* —— 风格转换：真实调色预设 —— */
+function aiPanelStyle(main){
+  var c=getSel();
+  if(!c){main.appendChild(el('div','aic-note','请先在时间线选中一个视频/图片片段。'));return;}
+  var grid=el('div','fx-grid');
+  [['none','原片','保持当前调色'],['warm','暖阳','温暖橙红调'],['cool','冷冽','青蓝冷调'],
+   ['mono','黑白','经典单色'],['vintage','怀旧','低饱和胶片感'],['cyberpunk','赛博朋克','高饱和霓虹']].forEach(function(s){
+    var t=el('div','fx-tile'+((c.props.filterPreset||'none')===s[0]?' on':''),
+      '<div class="fx-swatch">'+icon('film',18)+'</div><div class="fx-name">'+s[1]+'</div><div class="fx-sub">'+s[2]+'</div>');
+    t.addEventListener('click',function(){
+      beginChange();setClipProp(c,'filterPreset',s[0]);endChange();
+      renderProps();requestPreviewDraw();
+      toast('已应用「'+s[1]+'」风格');closeModal();
     });
+    grid.appendChild(t);
+  });
+  main.appendChild(grid);
+  main.appendChild(el('div','aic-note','风格由真实调色管线渲染（预览 CSS filter + 导出同一实现）。基于神经网络的风格迁移开发中。'));
+}
+/* —— 创意辅助 —— */
+function aiPanelIdea(main){
+  var form=aiForm(main);
+  var ta=document.createElement('textarea');
+  ta.placeholder='输入你的简短想法，例如：海边骑自行车';
+  form.appendChild(ta);
+  var row=el('div','aic-row');
+  var kind=document.createElement('select');kind.className='ctl';
+  [['video','视频提示词'],['image','图片提示词']].forEach(function(kv){var op=document.createElement('option');op.value=kv[0];op.textContent=kv[1];kind.appendChild(op);});
+  row.appendChild(kind);
+  form.appendChild(row);
+  var out=document.createElement('textarea');
+  out.placeholder='润色结果会出现在这里（可全选复制）';
+  out.style.height='72px';
+  main.appendChild(el('div','field-label','润色结果'));
+  main.appendChild(out);
+  var st=el('div','ai-status','');main.appendChild(st);
+  var err=el('div','ai-err');main.appendChild(err);
+  var go=el('button','btn primary',icon('wand',13)+' 润色');
+  go.style.marginTop='10px';main.appendChild(go);
+  go.addEventListener('click',function(){
+    var p=ta.value.trim();
+    if(!p){err.textContent='请先输入想法';err.classList.add('on');return;}
+    err.classList.remove('on');go.disabled=true;st.textContent='Qwen 润色中…';
+    fetch(API_BASE+'/api/ai/prompt',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt:p,kind:kind.value}),signal:AbortSignal.timeout(65000)})
+      .then(function(r){return r.json().then(function(j){return {code:r.status,j:j};});})
+      .then(function(res){
+        if(res.code!==200)throw new Error(res.j.error||'润色失败');
+        out.value=res.j.prompt;st.textContent='✓ 完成。可全选复制';
+      })
+      .catch(function(e){err.textContent='润色失败：'+((e&&e.message)||e)+'（需要 DashScope Key）';err.classList.add('on');})
+      .then(function(){go.disabled=false;});
   });
 }
 function runAIgeneration(prompt,sec,caps){
@@ -5067,7 +5493,7 @@ function collectEls(){
    'btnZoomOut','zoomSlider','btnZoomIn','zoomLabel','tlBody','trackHeads','corner','headsInner',
    'tlWrap','tlCanvas','vScroll','vThumb','hScroll','hThumb',
    'rightPanel','propsBody','btnRightCollapse','btnRightExpand',
-   'ghost','toasts','ctxMenu','modalMask','modalTitle','modalBody','modalClose','fileInput',
+   'ghost','toasts','ctxMenu','modalMask','modal','modalTitle','modalBody','modalClose','fileInput',
    'agreeMask','agreeChk','agreeBtn',
    'bottomNav','bnMedia','bnText','bnAI','bnProps','bnExport',
    'sheetMedia','sheetMediaBody','sheetProps','sheetPropsBody'
