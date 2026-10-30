@@ -1723,9 +1723,12 @@ function muxMp4FromChunks(frames,width,height,desc){
       120 帧导致硬件编码器队列冻结在 115）；
    ④ 帧循环用 MessageChannel 让出主线程 —— setTimeout 在后台标签页会被
       浏览器节流到 1 次/秒（用户生成时常切换窗口），MessageChannel 不受影响。 */
-function encodeCanvasToMp4(W,H,fps,N,drawFrame,onProgress,cancelToken,audio){
+function encodeCanvasToMp4(W,H,fps,N,drawFrame,onProgress,cancelToken,audio,opts){
   if(!window.VideoEncoder)return Promise.reject(new Error('当前浏览器不支持视频编码'));
-  var bitrate=Math.min(12e6,Math.max(1.5e6,Math.round(W*H*4.5))); // 码率随分辨率自适应
+  opts=opts||{};
+  // 显式码率优先；auto 时按分辨率自适应（0.08 bpp/帧 上限 48Mbps，4K60 也可用）
+  var bitrate=opts.bitrate>0?opts.bitrate
+    :Math.min(48e6,Math.max(1.5e6,Math.round(W*H*fps*0.08)));
   function yieldUI(){
     return new Promise(function(res){
       var ch=new MessageChannel();
@@ -2734,9 +2737,51 @@ var EffectPipe=(function(){
     presetOffsets:presetOffsets,ensureFilter:ensureFilter,chromaKey:chromaKey};
 })();
 
+/* ============================================================
+   App —— 结构操作的统一分发入口（dispatch 桥接层）
+   每个结构变更构造 RFC 6901 JSON Pointer op → DispatchCore 校验+记录
+   （镜像 op 流水，为云协作/同步 diff 预留）→ apply() 应用真实 State
+   真实 State 的撤销仍由快照机制管理（已验证），op 记录失败不阻塞操作
+   ============================================================ */
+var _dcore=(window.DispatchCore?new window.DispatchCore({tracks:[],clips:[]},{projectId:'local',assertMode:false}):null);
+var App={
+  lamport:0,
+  dispatch:function(op,apply){
+    if(_dcore&&op&&op.path){
+      try{
+        op.opId=op.opId||uid('op');
+        op.actorId='local-user';
+        op.lamport=++App.lamport;
+        op.projectId='local';
+        _dcore.dispatch(op);
+      }catch(e){console.warn('[WebCut] op 记录失败（操作继续）：',e&&e.message);}
+    }
+    if(apply)apply();
+  },
+  setProp:function(clipId,key,value,apply){
+    App.dispatch({path:'/clips/'+clipId+'/props/'+key,action:'set',value:value,meta:{kind:'setProp'}},apply);
+  },
+  clipAdd:function(clip,apply){
+    App.dispatch({path:'/clips',action:'insert',value:safeOpValue(clip),meta:{kind:'clipAdd'}},apply);
+  },
+  clipDelete:function(clipId,apply){
+    App.dispatch({path:'/clips/'+clipId,action:'delete',meta:{kind:'clipDelete'}},apply);
+  },
+  clipMove:function(clipId,start,trackId,apply){
+    App.dispatch({path:'/clips/'+clipId,action:'set',value:{start:start,trackId:trackId},
+      meta:{kind:'clipMove',partial:true}},apply);
+  },
+  clipSplit:function(srcId,right,apply){
+    App.dispatch({path:'/clips',action:'insert',value:safeOpValue(right),meta:{kind:'clipSplit',srcId:srcId}},apply);
+  }
+};
+function safeOpValue(o){
+  try{JSON.stringify(o);return o;}catch(e){return {id:o&&o.id};}
+}
+
 /* 属性写入统一入口：写 props + 同步 DAG 节点参数 + 失效效果缓存 + 触发重绘 */
 function setClipProp(clip,key,v){
-  clip.props[key]=v;
+  App.setProp(clip.id,key,v,function(){clip.props[key]=v;});
   if(clip.renderGraph){
     var map={transform:'node_transform',color:'node_color',blur:'node_blur',sharpen:'node_sharpen',chromaKey:'node_chromakey'};
     for(var nt in map){
@@ -3734,6 +3779,7 @@ function splitSelected(){
     right.keyframes=c.keyframes.filter(function(k){return k>=c.duration;}).map(function(k){return k-c.duration;});
     c.keyframes=c.keyframes.filter(function(k){return k<c.duration;});
     c.duration=t-c.start;
+    App.clipSplit(c.id,right);
     State.clips.push(right);done++;
     if(State.selection===c.id)State.selection=right.id;
     var mi=State.multiSel.indexOf(c.id);
@@ -3748,7 +3794,7 @@ function deleteSelected(){
   var ids=selIds();
   if(!ids.length)return toast('请先选择片段');
   beginChange();
-  ids.forEach(function(id){EffectPipe.dispose(id);}); // 释放动态 SVG 滤镜与键控缓存
+  ids.forEach(function(id){EffectPipe.dispose(id);App.clipDelete(id);}); // 释放效果缓存 + 记录 op
   State.clips=State.clips.filter(function(x){return ids.indexOf(x.id)<0;});
   State.selection=null;State.selKF=null;State.multiSel=[];
   endChange();renderProps();requestRender();
@@ -3779,6 +3825,7 @@ function pasteClips(baseTime){
       if(!tr)tr=addTrackOf(type);
     }
     n.trackId=tr.id;
+    App.clipAdd(n);
     State.clips.push(n);newIds.push(n.id);
   });
   State.selection=newIds[0];State.multiSel=newIds;State.selKF=null;
@@ -3813,14 +3860,17 @@ function addClipFromLib(item,trackType,time){
   var clip={id:uid('c'),trackId:tr.id,start:Math.max(0,time),duration:dur,label:item.name,
     props:defaultProps(),keyframes:[],sourceId:item.sourceId||null,
     srcDuration:item.meta?item.meta.duration:null};
+  App.clipAdd(clip);
   State.clips.push(clip);
   if(clip.sourceId&&item.meta&&item.meta.hasAudio){ // 关联音频：同一解码源的音频自动铺到音频轨
     var atr=null;
     for(var k2=0;k2<State.tracks.length;k2++)if(State.tracks[k2].type==='audio'&&!State.tracks[k2].locked){atr=State.tracks[k2];break;}
     if(!atr)atr=addTrackOf('audio');
-    State.clips.push({id:uid('c'),trackId:atr.id,start:clip.start,duration:clip.duration,
+    var aud={id:uid('c'),trackId:atr.id,start:clip.start,duration:clip.duration,
       label:item.name+' 音频',props:defaultProps(),keyframes:[],
-      sourceId:clip.sourceId,srcDuration:clip.srcDuration});
+      sourceId:clip.sourceId,srcDuration:clip.srcDuration};
+    App.clipAdd(aud);
+    State.clips.push(aud);
   }
   State.selection=clip.id;State.selKF=null;
   endChange();
@@ -3946,7 +3996,14 @@ function bindTimelinePointer(){
     if(!drag)return;
     if(drag.mode==='marquee'){applyMarquee(drag);drag=null;requestRender();return;}
     if(drag.mode==='moveMulti'&&!drag.moved){endChange();} // 未真正移动 → 不留历史
-    else if(drag.mode!=='playhead')endChange();
+    else if(drag.mode!=='playhead'){
+      var fc=getClipById(drag.clipId);
+      if(fc&&(drag.mode==='move'||drag.mode==='moveMulti'))
+        App.clipMove(fc.id,fc.start,fc.trackId);
+      else if(fc)App.dispatch({path:'/clips/'+fc.id,action:'set',
+        value:{start:fc.start,duration:fc.duration},meta:{kind:'clipTrim',partial:true}});
+      endChange();
+    }
     State.snapLineT=null;drag=null;requestRender();
   };
   cv.addEventListener('pointerup',finish);
@@ -4286,7 +4343,8 @@ function drawFakeQr(canvas,seedStr){
 /* —— 导出音频：时间线 → 分窗离线渲染（30s/窗，内存有界）→ AAC 编码 ——
    全量源整段调度；流式源按分段调度（缺段先解码再排），音量/淡入淡出随片段应用；
    PTS 拉长的冻结区不出声（与播放行为一致）。AAC 不可用时返回 {skipped}，导出降级无声。 */
-function exportAudioTrack(dur,onProgress){
+function exportAudioTrack(dur,onProgress,audioBitrate){
+  audioBitrate=audioBitrate>0?audioBitrate:128000;
   var SR=48000,CH=2,WIN=30;
   var clips=[];
   for(var i=0;i<State.tracks.length;i++){
@@ -4299,7 +4357,7 @@ function exportAudioTrack(dur,onProgress){
   }
   if(!clips.length)return Promise.resolve(null);
   if(typeof window.AudioEncoder!=='function')return Promise.resolve({skipped:'no-audio-encoder'});
-  return AudioEncoder.isConfigSupported({codec:'mp4a.40.2',sampleRate:SR,numberOfChannels:CH,bitrate:128000})
+  return AudioEncoder.isConfigSupported({codec:'mp4a.40.2',sampleRate:SR,numberOfChannels:CH,bitrate:audioBitrate})
     .catch(function(){return {supported:false};})
     .then(function(probe){
       if(!probe||!probe.supported)return {skipped:'aac-unsupported'};
@@ -4316,7 +4374,7 @@ function exportAudioTrack(dur,onProgress){
             },
             error:function(e){encErr=e.message;}
           });
-          enc.configure({codec:'mp4a.40.2',sampleRate:SR,numberOfChannels:CH,bitrate:128000});
+          enc.configure({codec:'mp4a.40.2',sampleRate:SR,numberOfChannels:CH,bitrate:audioBitrate});
         }catch(e){resolve({skipped:'aac-configure'});return;}
         var winCount=Math.max(1,Math.ceil(dur/WIN)),w=0;
         function nextWindow(){
@@ -4433,11 +4491,12 @@ function drawExportFrame(ctx,t,W,H,watermark){
     ctx.fillText('WebCut 剪辑',W-W*0.03,H-H*0.035);
   }
 }
-function runRealExport(selRes,watermark,onStage){
+function runRealExport(selRes,watermark,onStage,settings){
+  settings=settings||{};
   var dur=projectDuration();
   var parts=State.ratio.split(':'),rw=+parts[0]||16,rh=+parts[1]||9;
   var H=selRes,W=Math.round(H*rw/rh/2)*2; // 编码器要求偶数尺寸
-  var fps=30,N=Math.max(1,Math.round(dur*fps));
+  var fps=settings.fps||30,N=Math.max(1,Math.round(dur*fps));
   onStage('正在准备素材…',0.04);
   var srcIds={};
   State.clips.forEach(function(c){if(c.sourceId&&trackTypeOf(c)==='video')srcIds[c.sourceId]=1;});
@@ -4454,16 +4513,22 @@ function runRealExport(selRes,watermark,onStage){
   var audioResult=null;
   return chain.then(function(){
     onStage('正在合成音频…',0.24);
-    return exportAudioTrack(dur,function(p){onStage('正在合成音频…',0.24+0.12*p);});
+    return exportAudioTrack(dur,function(p){onStage('正在合成音频…',0.24+0.12*p);},settings.audioBitrate||0);
   }).then(function(a){
     if(a&&a.skipped)toast('当前浏览器不支持 AAC 音频编码，本次导出为无声视频');
     audioResult=a&&!a.skipped?a:null;
     return audioResult;
   }).then(function(audio){
     onStage('正在渲染…',0.36);
+    var t0=performance.now();
     return encodeCanvasToMp4(W,H,fps,N,function(fi,ctx){
       drawExportFrame(ctx,fi/fps,W,H,watermark);
-    },function(p){onStage('正在渲染…',0.36+p*0.59);},null,audio);
+    },function(p){
+      // 剩余时间估算：按已耗时间的进度外推（进度 <5% 时数据不足，不显示）
+      var el=(performance.now()-t0)/1000;
+      var eta=(p>=0.05&&p<1)?Math.max(1,Math.round(el/p-el)):0;
+      onStage('正在渲染… '+Math.round(p*100)+'%'+(eta?'（剩余约 '+eta+' 秒）':''),0.36+p*0.59);
+    },null,audio,{bitrate:settings.videoBitrate||0});
   }).then(function(file){
     onStage('导出完成',1);
     return file;
@@ -4522,7 +4587,25 @@ function openExportModal(){
     +'<div class="m-row"><span>分辨率</span><select class="ctl" id="expRes">'
     +'<option value="720" selected>720P 标准</option>'
     +'<option value="1080">1080P 高清'+(limRes<1080?' · 专业版':'')+'</option>'
-    +'<option value="2160">2160P 4K'+(limRes<2160?' · 专业版':'')+'</option>'
+    +'<option value="1440">2K 超清'+(limRes<1440?' · 专业版':'')+'</option>'
+    +'<option value="2160">4K 影院级'+(limRes<2160?' · 专业版':'')+'</option>'
+    +'</select></div>'
+    +'<div class="m-row"><span>帧率</span><select class="ctl" id="expFps">'
+    +'<option value="24">24 FPS · 电影感</option>'
+    +'<option value="30" selected>30 FPS · 标准</option>'
+    +'<option value="60">60 FPS · 流畅</option>'
+    +'</select></div>'
+    +'<div class="m-row"><span>视频码率</span><select class="ctl" id="expVbr">'
+    +'<option value="0" selected>自动（按分辨率适配）</option>'
+    +'<option value="8000000">8 Mbps · 通用</option>'
+    +'<option value="12000000">12 Mbps · 高质量</option>'
+    +'<option value="20000000">20 Mbps · 高码率</option>'
+    +'<option value="40000000">40 Mbps · 接近无损</option>'
+    +'</select></div>'
+    +'<div class="m-row"><span>音频码率</span><select class="ctl" id="expAbr">'
+    +'<option value="128000" selected>128 kbps · 标准</option>'
+    +'<option value="192000">192 kbps · 良好</option>'
+    +'<option value="256000">256 kbps · 高保真</option>'
     +'</select></div>'
     +'<div class="m-plan">当前套餐：'+(isPro?'专业版':'免费版')+' · '+(wm?'导出含水印':'无水印')+' · 工程时长 '+fmt(projectDuration())
     +(isPro?'':'<button class="linklike" id="expUpgrade">升级专业版，解锁无水印与高清 →</button>')
@@ -4548,10 +4631,16 @@ function openExportModal(){
     var go=$id('expGo'),stage=$id('expStage');
     go.disabled=true;go.textContent='导出中…';
     $id('expProg').classList.add('on');
-    runRealExport(selRes,wm,function(txt,p){
-      stage.textContent=txt;
-      $id('expProgBar').style.width=Math.round(clamp(p,0,1)*100)+'%';
-    }).then(function(file){
+    var settings={fps:+$id('expFps').value||30,
+      videoBitrate:+$id('expVbr').value||0,
+      audioBitrate:+$id('expAbr').value||128000};
+    var runExport=function(){
+      return runRealExport(selRes,wm,function(txt,p){
+        stage.textContent=txt;
+        $id('expProgBar').style.width=Math.round(clamp(p,0,1)*100)+'%';
+      },settings);
+    };
+    runExport().then(function(file){
       var url=URL.createObjectURL(file);
       var a=document.createElement('a');
       a.href=url;
@@ -4560,11 +4649,13 @@ function openExportModal(){
       document.body.appendChild(a);a.click();a.remove();
       setTimeout(function(){URL.revokeObjectURL(url);},4000);
       go.disabled=false;go.textContent='重新导出';
+      $id('expProg').classList.remove('on');
       if(isWav)toast('已导出纯音频 WAV（视频编码失败已降级）');
-      else toast('导出完成，视频已开始下载'+(wm?'（含水印）':''));
+      else toast('导出完成（'+selRes+'P/'+settings.fps+'FPS），视频已开始下载'+(wm?'（含水印）':''));
     }).catch(function(e){
-      go.disabled=false;go.textContent='重试';
-      stage.textContent='导出失败：'+((e&&e.message)||e);
+      go.disabled=false;go.textContent='重试导出';
+      $id('expProg').classList.remove('on');
+      stage.textContent='导出失败：'+((e&&e.message)||e)+' —— 点击「重试导出」可再试一次';
     });
   });
 }
@@ -5878,7 +5969,8 @@ function init(){
     RenderCoordinator:window._renderCoord,DAGEngine:window.DAGEngine,
     muxMp4FromChunks:muxMp4FromChunks,mockGenerateVideo:mockGenerateVideo,makeMockBGM:makeMockBGM,
     ops:{copy:copySelected,paste:pasteClips,duplicate:duplicateSelected,del:deleteSelected,split:splitSelected,selectAll:selectAllClips},
-    EffectPipe:EffectPipe,setClipProp:setClipProp,
+    EffectPipe:EffectPipe,setClipProp:setClipProp,App:App,
+    opLog:function(){return _dcore?_dcore.opLog.slice():[];},
     version:'0.3.0-studio'};
 }
 
