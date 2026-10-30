@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>WebCut 自检测试</title>
+<style>
+body{background:#0e1013;color:#e8eaee;font-family:Consolas,monospace;font-size:13px;padding:24px;max-width:1100px;margin:0 auto}
+h1{font-size:16px;color:#6db2ff}
+#bar{height:5px;background:#23272f;border-radius:3px;margin:12px 0 18px;overflow:hidden}
+#bar i{display:block;height:100%;width:0;background:#3d8fe0;transition:width .2s}
+.case{padding:5px 10px;border-left:2px solid #333a44;margin:3px 0}
+.case.pass{border-color:#5ecb94}
+.case.fail{border-color:#e5727f;background:rgba(229,114,127,.06)}
+.case b{color:#9aa3af;font-weight:normal;margin-right:10px}
+.case.pass b::after{content:'PASS';color:#5ecb94}
+.case.fail b::after{content:'FAIL';color:#e5727f}
+#summary{margin-top:18px;font-size:14px}
+#summary b{font-size:18px}
+iframe{width:100%;height:620px;border:1px solid #333a44;border-radius:6px;background:#000;margin-top:14px}
+</style>
+</head>
+<body>
+<h1>WebCut 自动化自检（编辑器冒烟 + 单元 + 安全）</h1>
+<div id="bar"><i></i></div>
+<div id="cases"></div>
+<div id="summary"></div>
+<iframe id="ed" src="/"></iframe>
+<script>
+'use strict';
+var CASES=[];
+function tcase(name,fn){CASES.push({name:name,fn:fn});}
+var bar=document.getElementById('bar'),casesEl=document.getElementById('cases'),sum=document.getElementById('summary');
+
+/* ---------- 纯 JS 单元（无 DOM 依赖） ---------- */
+tcase('NodeRegistry: 5 类节点全部注册',function(){return waitEd().then(function(d){
+  var r=d.NodeRegistry.registry.types();
+  return ['transform','color','blur','sharpen','chromaKey'].every(function(t){return r.indexOf(t)>=0;});
+});});
+tcase('NodeRegistry: uiSchema 中文标签',function(){return waitEd().then(function(d){
+  var s=d.NodeRegistry.registry.uiSchema('chromaKey',{});
+  return s.length===4&&s[0].label==='启用色度键'&&s[1].label==='键控颜色';
+});});
+tcase('NodeRegistry: validateNode 越界 clamp',function(){return waitEd().then(function(d){
+  var r=d.NodeRegistry.registry;
+  var out=r.validateNode({id:'x',type:'color',inputs:[],params:{brightness:999,saturation:-999}});
+  return out.params.brightness===100&&out.params.saturation===-100;
+});});
+tcase('NodeRegistry: 预设导入导出往返',function(){return waitEd().then(function(d){
+  var r=d.NodeRegistry;
+  var g={nodes:[{id:'n1',type:'color',inputs:[],params:{brightness:10}}],output:'n1'};
+  var json=r.exportPreset(g);
+  var back=r.importPreset(json);
+  return back.nodes.length===1&&back.nodes[0].params.brightness===10;
+});});
+tcase('DispatchCore: dispatch + opLog + undo',function(){return waitEd().then(function(d){
+  var dc=new d.DispatchCore({clips:[]},{assertMode:false});
+  dc.dispatch({opId:'t1',path:'/clips',action:'insert',value:{id:'c1',label:'x'},meta:{}});
+  dc.dispatch({opId:'t2',path:'/clips/0/label',action:'set',value:'y',meta:{}});
+  var ok=dc.project.clips.length===1&&dc.project.clips[0].label==='y';
+  dc.undo();
+  return ok&&dc.project.clips[0].label==='x';
+});});
+tcase('DispatchCore: 100 次 dispatch 性能 <100ms',function(){return waitEd().then(function(d){
+  var dc=new d.DispatchCore({clips:[]},{assertMode:false});
+  var t0=performance.now();
+  for(var i=0;i<100;i++)dc.dispatch({opId:'p'+i,path:'/clips',action:'set',value:i,meta:{transient:true}});
+  return performance.now()-t0<100;
+});});
+
+/* ---------- 编辑器集成（iframe 内） ---------- */
+function ed(){
+  var d=document.getElementById('ed').contentWindow;
+  return d&&d.__EDITOR__?d:null;
+}
+function waitEd(){return new Promise(function(res){var n=0;(function p(){var d=ed();if(d||n++>60)return res(d);setTimeout(p,250);})();});}
+
+tcase('页面加载：编辑器初始化且无控制台错误',function(){return waitEd().then(function(d){
+  if(!d)return false;
+  return (d.__ERRS__||[]).filter(function(e){return e.indexOf('favicon')<0;}).length===0;
+});});
+tcase('时间线渲染：6 个种子片段 + 3 轨道',function(){return waitEd().then(function(d){
+  return d.__EDITOR__.State.clips.length>=6&&d.__EDITOR__.State.tracks.length===3;
+});});
+tcase('opLog：App.dispatch 记录结构操作',function(){return waitEd().then(function(d){
+  var E=d.__EDITOR__;
+  E.setClipProp(E.State.clips[0],'brightness',25);
+  var ops=E.opLog();
+  return ops.length>=1&&ops[ops.length-1].path.indexOf('/props/brightness')>0;
+});});
+tcase('撤销/重做：操作可完整回滚',function(){return waitEd().then(function(d){
+  var E=d.__EDITOR__,n=E.State.clips.length;
+  E.ops.selectAll();E.ops.copy();E.ops.paste(25);
+  var after=E.State.clips.length;
+  d.document.dispatchEvent(new KeyboardEvent('keydown',{key:'z',ctrlKey:true,bubbles:true}));
+  return E.State.clips.length===n&&after>n;
+});});
+tcase('多选与批量删除',function(){return waitEd().then(function(d){
+  var E=d.__EDITOR__;
+  E.ops.selectAll();
+  var n=E.State.clips.length;
+  // 全选后复制粘贴，再删粘贴组
+  E.ops.copy();E.ops.paste(40);
+  E.ops.del();
+  return E.State.clips.length===n;
+});});
+tcase('EffectPipe：色度键真实像素处理',function(){return waitEd().then(function(d){
+  var EP=d.__EDITOR__.EffectPipe;
+  var cv=d.document.createElement('canvas');cv.width=cv.height=40;
+  var cx=cv.getContext('2d');cx.fillStyle='#00d152';cx.fillRect(0,0,40,40);
+  var out=d.document.createElement('canvas');out.width=out.height=40;
+  var ox=out.getContext('2d');
+  EP.drawFrame(ox,{bitmap:cv,w:40,h:40},{ckEnabled:true,ckColor:'#00d152',ckSimilarity:30,ckSmoothness:10},40,40,{clipId:'t',pxScale:1,ckMaxW:40});
+  var px=ox.getImageData(20,20,1,1).data;
+  return px[3]<30; // 纯键控色应被抠透明
+});});
+tcase('项目管理：保存→索引→版本快照',function(){return waitEd().then(async function(d){
+  var PS=d.__EDITOR__.ProjectStore;
+  await PS.saveNow();
+  var idx=await PS.getKV('kv','project-index');
+  var v0=await PS.getKV('kv','project:'+PS.currentPid()+':v0');
+  return idx&&idx.length>=1&&!!v0;
+});});
+tcase('后端：health 接口可用',function(){return waitEd().then(async function(d){
+  var r=await d.fetch('/api/ai/health');
+  var j=await r.json();
+  return j.available===true&&'image' in j&&'prompt' in j;
+});});
+tcase('安全：路径遍历攻击被拒绝',function(){return waitEd().then(async function(d){
+  var a=await d.fetch('/ai-media/..%2f..%2fserver_flask.py');
+  var b=await d.fetch('/ai-media/%2e%2e%2f%2e%2e%2fserver_flask.py');
+  var c=await d.fetch('/ai-media/....//....//etc/passwd');
+  return a.status===404&&b.status===404&&c.status===404;
+});});
+tcase('安全：不存在的媒体文件返回 404 而非堆栈',function(){return waitEd().then(async function(d){
+  var r=await d.fetch('/ai-media/nonexistent-file-xyz.mp4');
+  var t=await r.text();
+  return r.status===404&&t.indexOf('Traceback')<0;
+});});
+
+/* ---------- 跑测 ---------- */
+(function run(){
+  var i=0,pass=0,fail=0;
+  function next(){
+    if(i>=CASES.length){
+      bar.firstElementChild.style.width='100%';
+      sum.innerHTML='结果：<b style="color:'+(fail?'#e5727f':'#5ecb94')+'">'+pass+' 通过 / '+fail+' 失败</b>（共 '+CASES.length+' 项）';
+      document.title='自检 '+pass+'/'+CASES.length;
+      return;
+    }
+    var c=CASES[i++];
+    var row=document.createElement('div');row.className='case';row.innerHTML='<b>'+c.name+'</b>运行中…';
+    casesEl.appendChild(row);
+    bar.firstElementChild.style.width=Math.round((i-1)/CASES.length*100)+'%';
+    Promise.resolve().then(c.fn).then(function(ok){
+      row.className='case '+(ok?'pass':'fail');
+      row.innerHTML='<b>'+c.name+'</b>'+(ok?'':'—— 返回 false');
+      ok?pass++:fail++;
+    }).catch(function(e){
+      row.className='case fail';
+      row.innerHTML='<b>'+c.name+'</b>异常：'+String(e&&(e.message||e)).slice(0,160);
+      fail++;
+    }).then(next);
+  }
+  next();
+})();
+</script>
+</body>
+</html>

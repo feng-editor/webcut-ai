@@ -2845,18 +2845,29 @@ var App={
     }
     if(apply)apply();
   },
+  /* clip 索引解析：RFC 6901 数组定位用数字索引（id 用于 meta 标识） */
+  clipIdx:function(clipId){
+    for(var i=0;i<State.clips.length;i++)if(State.clips[i].id===clipId)return i;
+    return -1;
+  },
   setProp:function(clipId,key,value,apply){
-    App.dispatch({path:'/clips/'+clipId+'/props/'+key,action:'set',value:value,meta:{kind:'setProp'}},apply);
+    var i=App.clipIdx(clipId);
+    if(i<0){if(apply)apply();return;}
+    App.dispatch({path:'/clips/'+i+'/props/'+key,action:'set',value:value,meta:{kind:'setProp',clipId:clipId}},apply);
   },
   clipAdd:function(clip,apply){
-    App.dispatch({path:'/clips',action:'insert',value:safeOpValue(clip),meta:{kind:'clipAdd'}},apply);
+    App.dispatch({path:'/clips',action:'insert',value:safeOpValue(clip),meta:{kind:'clipAdd',clipId:clip&&clip.id}},apply);
   },
   clipDelete:function(clipId,apply){
-    App.dispatch({path:'/clips/'+clipId,action:'delete',meta:{kind:'clipDelete'}},apply);
+    var i=App.clipIdx(clipId);
+    if(i<0){if(apply)apply();return;}
+    App.dispatch({path:'/clips/'+i,action:'delete',meta:{kind:'clipDelete',clipId:clipId}},apply);
   },
   clipMove:function(clipId,start,trackId,apply){
-    App.dispatch({path:'/clips/'+clipId,action:'set',value:{start:start,trackId:trackId},
-      meta:{kind:'clipMove',partial:true}},apply);
+    var i=App.clipIdx(clipId);
+    if(i<0){if(apply)apply();return;}
+    App.dispatch({path:'/clips/'+i,action:'set',value:{start:start,trackId:trackId},
+      meta:{kind:'clipMove',clipId:clipId,partial:true}},apply);
   },
   clipSplit:function(srcId,right,apply){
     App.dispatch({path:'/clips',action:'insert',value:safeOpValue(right),meta:{kind:'clipSplit',srcId:srcId}},apply);
@@ -4087,8 +4098,9 @@ function bindTimelinePointer(){
       var fc=getClipById(drag.clipId);
       if(fc&&(drag.mode==='move'||drag.mode==='moveMulti'))
         App.clipMove(fc.id,fc.start,fc.trackId);
-      else if(fc)App.dispatch({path:'/clips/'+fc.id,action:'set',
-        value:{start:fc.start,duration:fc.duration},meta:{kind:'clipTrim',partial:true}});
+      else if(fc){var fi=App.clipIdx(fc.id);
+        if(fi>=0)App.dispatch({path:'/clips/'+fi,action:'set',
+          value:{start:fc.start,duration:fc.duration},meta:{kind:'clipTrim',clipId:fc.id,partial:true}});}
       endChange();
     }
     State.snapLineT=null;drag=null;requestRender();
