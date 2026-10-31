@@ -297,6 +297,21 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .btn-row{display:flex;gap:8px;margin:8px 0}
 .batch-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--accent-dim)}
 .batch-info{font-size:11px;color:var(--accent-text);flex:1}
+/* ---------- v1.1 UI 精装修层 ---------- */
+:focus-visible{outline:2px solid var(--accent-deep);outline-offset:1px;border-radius:3px}
+.btn:active:not(:disabled){transform:translateY(1px)}
+body{animation:appfade .35s ease}
+@keyframes appfade{from{opacity:0}to{opacity:1}}
+.sec.open .sec-b{animation:secIn .14s ease}
+@keyframes secIn{from{opacity:.55}to{opacity:1}}
+#modal .m-head{background:var(--bg3)}
+.toast{border-left:3px solid var(--accent-deep)}
+.sk-wrap{display:flex;gap:14px;flex-wrap:wrap}
+.sk-group{flex:1 1 220px;border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--bg3);padding:8px 10px;min-width:0}
+.sk-title{font-size:11px;color:var(--faint);letter-spacing:1.5px;margin-bottom:6px}
+.sk-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:4px 0;font-size:12px;color:var(--text)}
+.sk-row span:first-child{color:var(--accent-text);background:var(--bg5);border:1px solid var(--line);border-radius:3px;padding:0 6px;font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.sk-row .sk-desc{color:var(--muted);text-align:right}
 #penOverlay{position:absolute;inset:0;z-index:5;display:none;cursor:crosshair;touch-action:none}
 #penOverlay.on{display:block}
 .sb-shot{border:1px solid var(--line);border-radius:var(--radius);background:var(--bg3);padding:8px 10px;margin-bottom:6px}
@@ -550,7 +565,8 @@ body.lib-dragging,body.lib-dragging *{cursor:grabbing!important;user-select:none
 /* ---------- 移动端深度适配（≤768px） ---------- */
 .panel-close{display:none;width:24px;height:24px;border:none;background:transparent;color:var(--muted);
   cursor:pointer;border-radius:4px;align-items:center;justify-content:center;flex:none;padding:0}
-#bottomNav{display:none;position:fixed;bottom:0;left:0;right:0;height:54px;z-index:200;
+#bottomNav,.mobile-sheet{display:none}
+#bottomNav{position:fixed;bottom:0;left:0;right:0;height:54px;z-index:200;
   background:rgba(19,21,25,.92);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
   border-top:1px solid var(--line);
   padding-bottom:env(safe-area-inset-bottom);
@@ -646,7 +662,7 @@ body.lib-dragging,body.lib-dragging *{cursor:grabbing!important;user-select:none
     <span class="brand-name">Web<b>Cut</b></span>
     <span class="brand-tag">STUDIO</span>
   </div>
-  <div class="tb-center"><span id="projName" contenteditable="true" spellcheck="false" title="点击编辑项目名称">未命名项目</span><span id="saveState"></span><span class="ph-chip" id="projMeta" title="项目画幅与导出默认帧率（点击切换帧率）"></span></div>
+  <div class="tb-center"><span id="projName" contenteditable="true" spellcheck="false" title="点击编辑项目名称">未命名项目</span><span id="saveState"></span><span class="ph-chip" id="projMeta" title="项目画幅与导出默认帧率（点击切换帧率）"></span><span class="ph-chip" id="creditChip" style="display:none;cursor:pointer" title="AI 积分（点击查看套餐与用量）"></span></div>
   <button class="btn iconb" id="btnUndo" title="撤销 (Ctrl+Z)"></button>
   <button class="btn iconb" id="btnRedo" title="重做 (Ctrl+Y)"></button>
   <div class="vdiv"></div>
@@ -3630,7 +3646,7 @@ function drawTimeline(){
       ctx.setLineDash([]);ctx.shadowBlur=0;
     }
   }
-  // 播放头（赛博青发光）
+  // 播放头（冰蓝）
   var px=timeToX(State.playhead);
   if(px>=-8&&px<=W+8){
     ctx.strokeStyle='#6db2ff';ctx.lineWidth=1.5;
@@ -3639,6 +3655,19 @@ function drawTimeline(){
     ctx.shadowBlur=0;
     ctx.fillStyle='#6db2ff';
     ctx.beginPath();ctx.moveTo(px-5,0);ctx.lineTo(px+5,0);ctx.lineTo(px+5,8);ctx.lineTo(px,13);ctx.lineTo(px-5,8);ctx.closePath();ctx.fill();
+    // 拖动播放头时的时间气泡（精准定位）
+    if(drag&&drag.mode==='playhead'){
+      var lb=fmt(State.playhead);
+      ctx.font='600 11px system-ui';
+      var tw=ctx.measureText(lb).width+14;
+      var bx=clamp(px-tw/2,4,W-tw-4);
+      rr(ctx,bx,3,tw,19,4);
+      ctx.fillStyle='rgba(14,16,19,0.94)';ctx.fill();
+      ctx.strokeStyle='rgba(109,178,255,0.65)';ctx.lineWidth=1;ctx.stroke();
+      ctx.fillStyle='#a8d0ff';ctx.textAlign='center';ctx.textBaseline='middle';
+      ctx.fillText(lb,bx+tw/2,13);
+      ctx.textAlign='left';ctx.textBaseline='alphabetic';
+    }
   }
 }
 function drawClip(ctx,c,x,y,w,h){
@@ -5989,6 +6018,23 @@ function openExportModal(){
     });
   });
 }
+/* ---------- 键盘快捷键帮助（? 呼出） ---------- */
+function openShortcutsModal(){
+  var G=[
+    ['播放控制',[['空格','播放 / 暂停'],['← / →','播放头 ±0.1s'],['Shift+← / →','播放头 ±1s'],['Home / End','跳到开头 / 结尾']]],
+    ['片段编辑',[['S','在播放头处分割'],['Del / Backspace','删除选中片段'],['Ctrl+C / V','复制 / 粘贴'],['Ctrl+D','创建副本'],['Ctrl+A','全选片段'],['Esc','取消选择']]],
+    ['视图与时间线',[['Ctrl+滚轮','时间线缩放'],['Shift+滚轮','垂直滚动'],['空白拖动','框选多片段'],['右键','上下文菜单']]],
+    ['工程',[['Ctrl+Z / Y','撤销 / 重做'],['Ctrl+S','立即保存'],['?','快捷键帮助']]]
+  ];
+  var rows=G.map(function(g){
+    return '<div class="sk-group"><div class="sk-title">'+g[0]+'</div>'
+      +g[1].map(function(k){return '<div class="sk-row"><span>'+k[0]+'</span><span class="sk-desc">'+k[1]+'</span></div>';}).join('')
+      +'</div>';
+  }).join('');
+  openModal('键盘快捷键','<div class="sk-wrap">'+rows+'</div>'
+    +'<div class="m-actions"><button class="btn primary" id="skOk">关闭</button></div>');
+  $id('skOk').addEventListener('click',closeModal);
+}
 /* ---------- 项目管理器：列表/打开/重命名/副本/删除/导入/导出 ---------- */
 function openProjectsModal(){
   openModal('项目管理','<div id="pmLoading" class="ai-status">读取项目列表…</div><div class="pm-list" id="pmList"></div>'
@@ -6111,6 +6157,18 @@ function openSettingsModal(){
    ============================================================ */
 var UserState={email:null,plan:null,aiCredits:null};
 function userIsLoggedIn(){return !!UserState.email;}
+function updateUserChip(){
+  var chip=document.getElementById('creditChip');
+  if(!chip)return;
+  if(userIsLoggedIn()){
+    chip.style.display='';
+    chip.textContent='⚡ '+UserState.aiCredits;
+    chip.onclick=function(){openProfileModal();};
+  }else{
+    chip.style.display='none';
+    chip.onclick=null;
+  }
+}
 function refreshUserState(){
   return fetch(API_BASE+'/api/auth/me',{headers:{'X-User-Token':PayClient.token()},signal:AbortSignal.timeout(4000)})
     .then(function(r){if(!r.ok)throw 0;return r.json();})
@@ -6148,6 +6206,7 @@ function openAuthModal(mode){
         setPlan(res.j.user.plan==='pro'?'pro':'free',true);
         els.btnUser.style.color='var(--accent)';
         els.btnUser.title=UserState.email+' · '+UserState.plan+' · AI 积分 '+UserState.aiCredits;
+        updateUserChip();
         closeModal();
         toast('欢迎，'+res.j.user.email+(mode==='register'?'（赠 100 AI 积分）':''));
         PayClient.health();
@@ -6186,6 +6245,8 @@ function openProfileModal(){
   if($id('pfLogout'))$id('pfLogout').addEventListener('click',function(){
     fetch(API_BASE+'/api/auth/logout',{method:'POST',headers:{'X-User-Token':PayClient.token()}}).catch(function(){});
     UserState.email=null;
+    updateUserChip();
+    els.btnUser.style.color='';
     toast('已退出登录（本机模式）');
     closeModal();
   });
@@ -7274,6 +7335,7 @@ function bindKeyboard(){
     else if(k==='ArrowRight'){e.preventDefault();seekTo(State.playhead+(e.shiftKey?1:0.1));}
     else if(k==='Home'){seekTo(0);}
     else if(k==='End'){seekTo(projectDuration());}
+    else if(k==='?'){openShortcutsModal();}
   });
 }
 
@@ -7321,6 +7383,7 @@ function init(){
   els.btnSettings.innerHTML=icon('settings',15);
   els.btnUser.innerHTML=icon('user',14);
   refreshUserState().then(function(u){
+    updateUserChip();
     if(u&&els.btnUser){
       els.btnUser.style.color='var(--accent)';
       els.btnUser.title=u.email+' · '+u.plan+' · AI 积分 '+u.aiCredits;
@@ -7387,7 +7450,7 @@ function init(){
   // 头像下拉：个人中心 / 设置 / 退出登录
   var um=els.userMenu;
   [['项目管理','layers',openProjectsModal],['个人中心','user',openProfileModal],
-   ['登录 / 注册账号','user',function(){openAuthModal('login');}],['设置','settings',openSettingsModal],['退出登录','logout',function(){
+   ['登录 / 注册账号','user',function(){openAuthModal('login');}],['键盘快捷键','settings',openShortcutsModal],['设置','settings',openSettingsModal],['退出登录','logout',function(){
     openModal('退出登录','<div class="m-note">当前为演示环境（无账号体系），退出后将回到初始状态。</div>'
       +'<div class="m-actions"><button class="btn" id="loNo">取消</button><button class="btn primary" id="loYes">退出</button></div>');
     $id('loNo').addEventListener('click',closeModal);
@@ -7508,6 +7571,7 @@ function init(){
     // 底部抽屉逻辑（互斥打开）
     function closeAllSheets(){
       document.querySelectorAll('.mobile-sheet').forEach(function(s){s.classList.remove('open');});
+      document.querySelectorAll('#bottomNav .bn-item').forEach(function(n){n.classList.remove('active');});
       // F3：属性面板归位（真实 DOM，保留全部 listener）
       if(window.__propsBodyHome&&els.propsBody.parentElement!==window.__propsBodyHome){
         window.__propsBodyHome.appendChild(els.propsBody);
@@ -7529,6 +7593,9 @@ function init(){
       }
       if(!isOpen){
         sheet.classList.add('open');
+        var bnMap={sheetMedia:'bnMedia',sheetProps:'bnProps'};
+        var bnEl=document.getElementById(bnMap[id]);
+        if(bnEl)bnEl.classList.add('active');
         if(id==='sheetProps'){
           // F3 修复：移动真实 propsBody 进抽屉（克隆不携带 listener 会导致控件全部失效），关闭时归还
           var pb=document.getElementById('sheetPropsBody');
@@ -7734,7 +7801,7 @@ function init(){
     EffectPipe:EffectPipe,setClipProp:setClipProp,App:App,resolveClipParams:resolveClipParams,ImageStore:ImageStore,drawExportFrame:drawExportFrame,renderAudioWindow:renderAudioWindow,
     ProxyStore:ProxyStore,generateProxyFor:generateProxyFor,
     opLog:function(){return _dcore?_dcore.opLog.slice():[];},
-    version:'1.0.0'};
+    version:'1.1.0'};
 }
 
 init();
