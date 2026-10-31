@@ -164,3 +164,31 @@ DAG 引擎、Worker 渲染、WebGL2 着色器、分发核心、节点注册表�
 ### 验证
 合成 1920×1080 真实源 → 代理 960×540 生成 ✓ → 代理帧维度 ✓ → 预览路由渲染 ✓ →
 导出模式切换（关/还原）✓ → 自检 16/16 回归 ✓
+
+## v1.0.0（2026-10-31）云端用户体系与商业化架构 —— 正式版
+
+### 用户体系（SQLite · PBKDF2 · 会话 Token）
+- 注册/登录/登出/me：邮箱+密码（PBKDF2-HMAC-SHA256 10 万次迭代+随机盐）
+- 会话 token（64hex）经 X-User-Token 传递；SQLite WAL，Flask 多线程安全
+- 旧式匿名 token 完整兼容（无 session 记录 → 原文件目录逻辑，老用户无感）
+- 注册限流 10 次/小时
+
+### 云端数据隔离升级
+- 登录用户云工程存 SQLite cloud_projects（按 user_id 隔离），匿名走原文件目录
+- usage 升级：plan/aiCredits/email 随用量返回
+
+### 商业化架构（Free/Pro/Studio 基座 · 不接真实支付）
+- users 表：plan/plan_expires/ai_credits；mock-pay 支付成功自动升级登录用户套餐
+- AI 积分真实闭环：注册赠 100；文生视频 20/图片 5/配音 2/分镜 1；余额不足 402 明确报错
+- 套餐权益：Free 720P/水印/标准音色；Pro 4K/无水印/高级音色（entitlements 由账号下发）
+
+### 运维
+- GET /api/status：版本/uptime/运行中任务数/DB 体积（服务监控）
+
+### 前端
+- 登录/注册弹窗（用户菜单入口）；登录后 avatar 高亮+悬浮信息、个人中心显示邮箱/套餐/积分/退出登录
+- 未登录保持本机模式，全部既有功能零影响
+
+### 验证
+curl E2E：注册/登录/错密拒绝/me/entitlements/云工程 PUT+GET（隔离）/usage/status 全过 ✓
+UI E2E：注册弹窗→个人中心登录态（邮箱/积分/退出按钮）✓；自检 16/16 回归 ✓

@@ -22,6 +22,7 @@ import uuid
 import hashlib
 import threading
 import requests as req_lib
+import re as _re
 
 app = Flask(__name__)
 CORS(app)  # 允许所有来源跨域（Netlify 前端需要）
@@ -30,6 +31,7 @@ CORS(app)  # 允许所有来源跨域（Netlify 前端需要）
 # 配置
 # ============================================================
 PORT = int(os.environ.get('PORT', '8787'))
+_STARTED = time.time()
 
 def _load_env_file():
     """读取 ai-backend/.env"""
@@ -90,6 +92,7 @@ _RATE_RULES = {  # 端点前缀 → (次数, 窗口秒)
     '/api/ai/tts': (10, 600),       # 10 次 / 10 分钟
     '/api/ai/prompt': (30, 600),    # 30 次 / 10 分钟
     '/api/ai/storyboard': (10, 600),  # 10 次 / 10 分钟
+    '/api/auth/register': (10, 3600),  # 注册限流：10 次 / 小时
 }
 _rate_hits = collections.defaultdict(collections.deque)  # (ip, prefix) → [timestamps]
 _rate_lock = threading.Lock()
@@ -276,6 +279,9 @@ def create_video_task():
                 TASKS[local_id]['error'] = str(e)
                 print(f'>>> [AI] 轮询异常: {e} <<<', flush=True)
 
+        u = _auth_user()
+        if u and not _spend_credits(u['id'], CREDIT_COST['video']):
+            return jsonify({'error': f'AI 积分不足（本次需 {CREDIT_COST["video"]}，余额 {u["ai_credits"]}）——可在个人中心查看套餐'}), 402
         threading.Thread(target=poll, daemon=True).start()
         return jsonify({'taskId': local_id})
 
@@ -427,6 +433,9 @@ def create_image_task():
                         t['status'] = 'failed'
                         t['error'] = str(e)
 
+        u = _auth_user()
+        if u and not _spend_credits(u['id'], CREDIT_COST['image']):
+            return jsonify({'error': f'AI 积分不足（本次需 {CREDIT_COST["image"]}，余额 {u["ai_credits"]}）'}), 402
         threading.Thread(target=poll, daemon=True).start()
         return jsonify({'taskId': local_id})
 
@@ -718,9 +727,17 @@ def mock_pay(order_id):
             token = o.get('token', '')
             if token:
                 days = PRICES[o['cycle']]['days']
-                ent = db['entitlements'].get(token) or {}
-                base = max(time.time(), ent.get('expiresAt', 0))
-                db['entitlements'][token] = {'plan': 'pro', 'expiresAt': base + days * 86400}
+                u = _auth_user()
+                if u:  # 登录用户 → SQLite 套餐
+                    con = _db()
+                    base = max(time.time(), u['plan_expires'])
+                    con.execute('UPDATE users SET plan=?, plan_expires=? WHERE id=?',
+                                ('pro', base + days * 86400, u['id']))
+                    con.commit(); con.close()
+                else:
+                    ent = db['entitlements'].get(token) or {}
+                    base = max(time.time(), ent.get('expiresAt', 0))
+                    db['entitlements'][token] = {'plan': 'pro', 'expiresAt': base + days * 86400}
             _db_save(db)
     return jsonify({'orderId': o['id'], 'status': o['status']})
 
@@ -728,6 +745,10 @@ def mock_pay(order_id):
 @app.route('/api/me/entitlements', methods=['GET'])
 def get_entitlements():
     token = request.headers.get('X-User-Token', '')
+    u = _auth_user()
+    if u:
+        return jsonify({'plan': _user_plan(u), 'email': u['email'],
+                        'aiCredits': u['ai_credits'], 'limits': _user_limits(u)})
     with _db_lock:
         db = _db_load()
     ent = db['entitlements'].get(token) if token else None
@@ -739,6 +760,162 @@ def get_entitlements():
 
 
 # ============================================================
+# 用户体系（v1.0）—— SQLite + PBKDF2 + AI 积分 + 云数据按用户隔离
+# 旧式匿名 token（无 session 记录）→ 兼容走原文件哈希目录，老用户无感
+# ============================================================
+import sqlite3
+import secrets as _secrets
+import hashlib as _hashlib
+
+DB_PATH = os.path.join(DATA_DIR, 'webcut.db')
+
+def _db():
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    con.execute('PRAGMA journal_mode=WAL')
+    return con
+
+def _db_init():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    con = _db()
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT UNIQUE NOT NULL,
+      pw_salt TEXT NOT NULL, pw_hash TEXT NOT NULL,
+      plan TEXT DEFAULT 'free', plan_expires REAL DEFAULT 0,
+      ai_credits INTEGER DEFAULT 100,
+      created_at REAL
+    );
+    CREATE TABLE IF NOT EXISTS sessions(
+      token TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+      created_at REAL, last_seen REAL
+    );
+    CREATE TABLE IF NOT EXISTS cloud_projects(
+      user_id INTEGER NOT NULL, project_key TEXT NOT NULL DEFAULT 'main',
+      name TEXT, data TEXT, updated_at REAL,
+      PRIMARY KEY(user_id, project_key)
+    );
+    """)
+    con.commit(); con.close()
+
+_db_init()
+
+def _pw_hash(pw, salt):
+    return _hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'), bytes.fromhex(salt), 100000).hex()
+
+def _auth_user():
+    """X-User-Token → session 用户；无 session 返回 None（匿名兼容模式）"""
+    token = request.headers.get('X-User-Token', '')
+    if not token:
+        return None
+    con = _db()
+    row = con.execute('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?',
+                      (token,)).fetchone()
+    con.close()
+    if not row:
+        return None
+    return {'id': row[0], 'email': row[1], 'plan': row[4],
+            'plan_expires': row[5], 'ai_credits': row[6]}
+
+def _user_plan(u):
+    if not u:
+        return 'free'
+    return u['plan'] if u['plan_expires'] > time.time() else 'free'
+
+def _user_limits(u):
+    plan = _user_plan(u)
+    if plan == 'pro':
+        return {'maxTimelines': 50, 'exportResolution': 2160, 'watermark': False}
+    return {'maxTimelines': 1, 'exportResolution': 720, 'watermark': True}
+
+def _spend_credits(user_id, amount):
+    """AI 积分扣减（余额不足返回 False）"""
+    con = _db()
+    row = con.execute('SELECT ai_credits FROM users WHERE id=?', (user_id,)).fetchone()
+    if not row or row[0] < amount:
+        con.close()
+        return False
+    con.execute('UPDATE users SET ai_credits=ai_credits-? WHERE id=?', (amount, user_id))
+    con.commit(); con.close()
+    return True
+
+CREDIT_COST = {'video': 20, 'image': 5, 'tts': 2, 'storyboard': 1}
+
+@app.route('/api/auth/register', methods=['POST'])
+def auth_register():
+    data = request.get_json(force=True, silent=True) or {}
+    email = (data.get('email') or '').strip().lower()
+    pw = data.get('password') or ''
+    if not _re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+        return jsonify({'error': '邮箱格式不正确'}), 400
+    if len(pw) < 6:
+        return jsonify({'error': '密码至少 6 位'}), 400
+    con = _db()
+    if con.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone():
+        con.close()
+        return jsonify({'error': '该邮箱已注册'}), 409
+    salt = _secrets.token_hex(16)
+    con.execute('INSERT INTO users(email,pw_salt,pw_hash,created_at) VALUES(?,?,?,?)',
+                (email, salt, _pw_hash(pw, salt), time.time()))
+    uid = con.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone()[0]
+    token = _secrets.token_hex(32)
+    con.execute('INSERT INTO sessions(token,user_id,created_at,last_seen) VALUES(?,?,?,?)',
+                (token, uid, time.time(), time.time()))
+    con.commit(); con.close()
+    print(f'[auth] 注册: {email}', flush=True)
+    return jsonify({'token': token, 'user': {'email': email, 'plan': 'free', 'aiCredits': 100}})
+
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login():
+    data = request.get_json(force=True, silent=True) or {}
+    email = (data.get('email') or '').strip().lower()
+    pw = data.get('password') or ''
+    con = _db()
+    row = con.execute('SELECT * FROM users WHERE email=?', (email,)).fetchone()
+    if not row:
+        con.close()
+        return jsonify({'error': '账号或密码错误'}), 401
+    if _pw_hash(pw, row[2]) != row[3]:
+        con.close()
+        return jsonify({'error': '账号或密码错误'}), 401
+    token = _secrets.token_hex(32)
+    con.execute('INSERT INTO sessions(token,user_id,created_at,last_seen) VALUES(?,?,?,?)',
+                (token, row[0], time.time(), time.time()))
+    con.commit(); con.close()
+    plan = row[4] if row[5] > time.time() else 'free'
+    print(f'[auth] 登录: {email}', flush=True)
+    return jsonify({'token': token, 'user': {'email': email, 'plan': plan, 'aiCredits': row[6]}})
+
+@app.route('/api/auth/logout', methods=['POST'])
+def auth_logout():
+    token = request.headers.get('X-User-Token', '')
+    con = _db()
+    con.execute('DELETE FROM sessions WHERE token=?', (token,))
+    con.commit(); con.close()
+    return jsonify({'ok': True})
+
+@app.route('/api/auth/me', methods=['GET'])
+def auth_me():
+    u = _auth_user()
+    if not u:
+        return jsonify({'error': '未登录'}), 401
+    return jsonify({'user': {'email': u['email'], 'plan': _user_plan(u),
+                             'aiCredits': u['ai_credits'], 'limits': _user_limits(u)}})
+
+@app.route('/api/status', methods=['GET'])
+def svc_status():
+    tasks_running = 0
+    with TASKS_LOCK:
+        tasks_running = sum(1 for t in TASKS.values() if t['status'] == 'running')
+    db_size = 0
+    try:
+        db_size = os.path.getsize(DB_PATH)
+    except Exception:
+        pass
+    return jsonify({'version': '1.0.0', 'uptime': round(time.time() - _STARTED, 1),
+                    'tasksRunning': tasks_running, 'dbSize': db_size})
+
+# ============================================================
 # 云同步
 # ============================================================
 @app.route('/api/cloud/status', methods=['GET'])
@@ -746,6 +923,20 @@ def cloud_status():
     token = request.headers.get('X-User-Token', '')
     if not token:
         return jsonify({'error': '缺少 Token'}), 401
+    u = _auth_user()
+    if u:  # 登录用户：云端工程存 SQLite（按 user_id 隔离）
+        con = _db()
+        row = con.execute('SELECT name,data,updated_at FROM cloud_projects WHERE user_id=? AND project_key=?',
+                          (u['id'], 'main')).fetchone()
+        con.close()
+        if not row:
+            return jsonify({'exists': False})
+        try:
+            rec = json.loads(row[1])
+            return jsonify({'exists': True, 'updatedAt': rec.get('updatedAt', row[2]),
+                            'clipCount': len(rec.get('clips', [])), 'name': row[0] or rec.get('name')})
+        except Exception:
+            return jsonify({'exists': False})
     root = os.path.join(CLOUD_DIR, hashlib.sha256(token.encode()).hexdigest()[:32])
     proot = os.path.join(root, 'project.json')
     try:
@@ -758,7 +949,29 @@ def cloud_status():
 
 
 @app.route('/api/cloud/project', methods=['GET', 'PUT'])
-def cloud_project():
+def cloud_project_user_aware():
+    u = _auth_user()
+    if u:
+        con = _db()
+        if request.method == 'GET':
+            row = con.execute('SELECT data FROM cloud_projects WHERE user_id=? AND project_key=?',
+                              (u['id'], 'main')).fetchone()
+            con.close()
+            if not row:
+                return jsonify({'error': '云端暂无备份'}), 404
+            return app.response_class(row[0], mimetype='application/json')
+        raw = request.get_data()
+        json.loads(raw.decode('utf-8'))
+        rec = json.loads(raw.decode('utf-8'))
+        con.execute('INSERT INTO cloud_projects(user_id,project_key,name,data,updated_at) VALUES(?,?,?,?,?) '
+                    'ON CONFLICT(user_id,project_key) DO UPDATE SET name=excluded.name,data=excluded.data,updated_at=excluded.updated_at',
+                    (u['id'], 'main', rec.get('name'), raw.decode('utf-8'), time.time()))
+        con.commit(); con.close()
+        print(f'[cloud] 用户工程已保存 ({len(raw)//1024}KB)', flush=True)
+        return jsonify({'ok': True})
+    return cloud_project()
+
+def cloud_project_legacy():
     token = request.headers.get('X-User-Token', '')
     if not token:
         return jsonify({'error': '缺少 Token'}), 401
@@ -835,7 +1048,18 @@ def cloud_usage():
                     used += os.path.getsize(os.path.join(dirpath, fn))
                 except Exception:
                     pass
-    return jsonify({'used': used, 'quota': 2 * 1024 * 1024 * 1024})
+    out = {'used': used, 'quota': 2 * 1024 * 1024 * 1024}
+    u = _auth_user()
+    if u:
+        con = _db()
+        row = con.execute('SELECT data FROM cloud_projects WHERE user_id=? AND project_key=?',
+                          (u['id'], 'main')).fetchone()
+        con.close()
+        out['used'] = len(row[0].encode('utf-8')) if row else 0
+        out['plan'] = _user_plan(u)
+        out['aiCredits'] = u['ai_credits']
+        out['email'] = u['email']
+    return jsonify(out)
 
 
 # ============================================================
