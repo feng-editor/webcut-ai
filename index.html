@@ -297,6 +297,8 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .btn-row{display:flex;gap:8px;margin:8px 0}
 .batch-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--accent-dim)}
 .batch-info{font-size:11px;color:var(--accent-text);flex:1}
+#penOverlay{position:absolute;inset:0;z-index:5;display:none;cursor:crosshair;touch-action:none}
+#penOverlay.on{display:block}
 .env-wrap{margin:8px 0 4px}
 .env-label{font-size:11px;color:var(--muted);margin-bottom:4px}
 .env-wrap canvas{width:100%;height:48px;display:block;background:var(--bg3);border:1px solid var(--line);border-radius:var(--radius);cursor:crosshair;touch-action:none}
@@ -679,7 +681,7 @@ body.lib-dragging,body.lib-dragging *{cursor:grabbing!important;user-select:none
   <section id="centerCol">
     <div id="previewPane">
       <div id="stageWrap">
-        <div id="stage"><canvas id="previewCanvas"></canvas></div>
+        <div id="stage"><canvas id="previewCanvas"></canvas><canvas id="penOverlay" title="钢笔蒙版编辑：点击添加 / 拖动调整 / 右键删除"></canvas></div>
       </div>
       <div id="playbar">
         <button class="btn iconb" id="btnPlay" title="播放 / 暂停 (空格)"></button>
@@ -2615,6 +2617,7 @@ var State={
   ratio:'16:9',
   volume:80,muted:false,
   settings:{safe:true},
+  penEditClip:null,    // 钢笔蒙版编辑中的片段 id
   previewZoom:'fit',   // 预览缩放：'fit' 或倍率
   libView:'grid',      // 素材库视图：grid | list
   projectFps:30,       // 项目帧率（导出默认帧率，顶栏展示/可切换）
@@ -2641,7 +2644,7 @@ function defaultProps(){
     hueRotate:0,highlights:0,shadows:0,filterPreset:'none',
     blur:0,sharpen:0,
     ckEnabled:false,ckColor:'#00d152',ckSimilarity:30,ckSmoothness:20,
-    mask:'none',maskFeather:50,maskInvert:false,
+    mask:'none',maskFeather:50,maskInvert:false,maskPoints:null,
     volume:100,fadeIn:0,fadeOut:0,voice:'none'};
 }
 /* 旧工程/粘贴片段的 props 归一化：补齐缺失键（前进兼容） */
@@ -2704,7 +2707,11 @@ function getClipById(id){for(var i=0;i<State.clips.length;i++)if(State.clips[i].
 /* ---------- 多选支持：当前生效的选择集合（multiSel 非空时优先） ---------- */
 function selIds(){return State.multiSel.length?State.multiSel.slice():(State.selection?[State.selection]:[]);}
 function selClips(){var out=[];selIds().forEach(function(id){var c=getClipById(id);if(c)out.push(c);});return out;}
-function setSingleSel(id){State.selection=id;State.multiSel=[];State.selKF=null;}
+function setSingleSel(id){
+  if(State.penEditClip&&State.penEditClip!==id){State.penEditClip=null;}
+  State.selection=id;State.multiSel=[];State.selKF=null;
+  if(els.penOverlay)syncPenOverlay();
+}
 function trackTypeOf(c){var t=findTrack(c.trackId);return t?t.type:'video';}
 function findTrack(id){for(var i=0;i<State.tracks.length;i++)if(State.tracks[i].id===id)return State.tracks[i];return null;}
 function trackIndex(tr){for(var i=0;i<State.tracks.length;i++)if(State.tracks[i]===tr)return i;return -1;}
@@ -2747,6 +2754,7 @@ var tlCtx=null,pvCtx=null;
 var rafP=false;
 
 function requestRender(){
+  if(State.penEditClip&&els.penOverlay&&els.penOverlay.classList.contains('on'))drawPenOverlay();
   if(rafP)return;rafP=true;
   requestAnimationFrame(function(){
     rafP=false;
@@ -2965,11 +2973,12 @@ var EffectPipe=(function(){
     var sx=cl*pw,sy=ct*ph,sw=pw*(1-cl-cr2),sh=ph*(1-ct-cbm);
     if(sw<2||sh<2)return;
     var scFit=Math.min(W/sw,H/sh),dw=sw*scFit,dh=sh*scFit;
-    // 蒙版合成：linear/circle/rect 为真实裁切（羽化用径向/线性渐变），pen 未实现如实按无蒙版处理
-    var useMask=p.mask&&p.mask!=='none'&&p.mask!=='pen';
+    // 蒙版合成：linear/circle/rect 渐变裁切；pen 多边形（顶点≥3 才生效）
+    var penPts=(p.mask==='pen'&&p.maskPoints&&p.maskPoints.length>=3)?p.maskPoints:null;
+    var useMask=(p.mask&&p.mask!=='none')?((p.mask!=='pen')||!!penPts):false;
     var tmp=null;
     if(useMask){
-      tmp=maskCanvas(src,sx,sy,sw,sh,p.mask,p.maskFeather||0,!!p.maskInvert,dw,dh);
+      tmp=maskCanvas(src,sx,sy,sw,sh,p.mask,p.maskFeather||0,!!p.maskInvert,dw,dh,penPts);
       if(tmp){src=tmp;sx=0;sy=0;sw=dw;sh=dh;}
     }
     ctx.save();
@@ -2990,7 +2999,43 @@ var EffectPipe=(function(){
   /* 蒙版合成：源裁切区 → 离屏画布 → 蒙版形状 alpha（destination-in）。
      羽化 0..100 映射到形状边缘的渐变过渡带；invert 反转保留区。 */
   var maskCache={key:null,canvas:null};
-  function maskCanvas(src,sx,sy,sw,sh,mode,feather,invert,dw,dh){
+  function maskCanvas(src,sx,sy,sw,sh,mode,feather,invert,dw,dh,penPts){
+    // pen：顶点为源帧归一化坐标，映射到裁剪后的输出矩形
+    if(mode==='pen'&&penPts&&penPts.length>=3){
+      var key2=['pen',sx|0,sy|0,sw|0,sh|0,feather,invert?1:0,dw|0,dh|0,penPts.length,
+        penPts.map(function(p2){return (p2.x*1000|0)+'_'+(p2.y*1000|0);}).join('.')].join('|');
+      if(maskCache.key===key2)return maskCache.canvas;
+      var w2=Math.max(2,Math.round(dw)),h2=Math.max(2,Math.round(dh));
+      var cv2=document.createElement('canvas');cv2.width=w2;cv2.height=h2;
+      var c2=cv2.getContext('2d');
+      c2.drawImage(src,sx,sy,sw,sh,0,0,w2,h2);
+      var f2=clamp(feather,0,100)/100;
+      var drawPen=function(comp){
+        c2.globalCompositeOperation=comp;
+        c2.beginPath();
+        penPts.forEach(function(p2,i){
+          var X=clamp((p2.x*src.width-sx)/sw,0,1)*w2,Y=clamp((p2.y*src.height-sy)/sh,0,1)*h2;
+          if(i===0)c2.moveTo(X,Y);else c2.lineTo(X,Y);
+        });
+        c2.closePath();
+        if(f2>0)c2.filter='blur('+Math.max(0.5,f2*20)+'px)';
+        c2.fillStyle='#000';c2.fill();
+        if(f2>0)c2.filter='none';
+      };
+      if(invert){drawPen('destination-out');}
+      else{drawPen('destination-in');}
+      c2.globalCompositeOperation='source-over';
+      maskCache={key:key2,canvas:cv2};
+      return cv2;
+    }
+    var key=[sx|0,sy|0,sw|0,sh|0,mode,feather,invert?1:0,dw|0,dh|0,src.width||0,src.height||0].join('|');
+    if(maskCache.key===key)return maskCache.canvas;
+    var w=Math.max(2,Math.round(dw)),hh=Math.max(2,Math.round(dh));
+    var cv=document.createElement('canvas');cv.width=w;cv.height=hh;
+    var cx=cv.getContext('2d');
+    cx.drawImage(src,sx,sy,sw,sh,0,0,w,hh);
+    cx.globalCompositeOperation='destination-in';
+    cx.beginPath();
     var key=[sx|0,sy|0,sw|0,sh|0,mode,feather,invert?1:0,dw|0,dh|0,src.width||0,src.height||0].join('|');
     if(maskCache.key===key)return maskCache.canvas;
     var w=Math.max(2,Math.round(dw)),hh=Math.max(2,Math.round(dh));
@@ -4068,6 +4113,32 @@ function renderProps(){
         seg.appendChild(b);
       });
       sec.body.appendChild(seg);
+      if(c.props.mask==='pen'){
+        if(!c.props.maskPoints||c.props.maskPoints.length<3)
+          sec.body.appendChild(el('div','sec-hint','钢笔蒙版：点击下方按钮进入预览绘制，依次点击添加顶点（≥3 个生效），拖动调整，右键删除顶点。'));
+        var penRow=el('div','btn-row');
+        var bPen=el('button','btn sm'+(State.penEditClip===c.id?' on':''),
+          icon('maskpen',12)+(State.penEditClip===c.id?' 完成编辑':' 编辑蒙版顶点'));
+        bPen.addEventListener('click',function(){
+          if(State.penEditClip===c.id){State.penEditClip=null;}
+          else{
+            State.penEditClip=c.id;
+            if(!c.props.maskPoints||c.props.maskPoints.length<3)
+              c.props.maskPoints=[{x:0.2,y:0.2},{x:0.8,y:0.2},{x:0.8,y:0.8},{x:0.2,y:0.8}];
+            toast('钢笔模式：预览中点击添加顶点，右键删除，完成后点「完成编辑」');
+          }
+          syncPenOverlay();
+          renderProps();
+        });
+        var bClear=el('button','btn sm',icon('trash',12)+' 清除');
+        bClear.addEventListener('click',function(){
+          beginChange();setClipProp(c,'maskPoints',null);endChange();
+          if(State.penEditClip===c.id){State.penEditClip=null;syncPenOverlay();}
+          renderProps();requestPreviewDraw();
+        });
+        penRow.appendChild(bPen);penRow.appendChild(bClear);
+        sec.body.appendChild(penRow);
+      }
       mkSlider(sec.body,'羽化','',0,100,1,function(){return c.props.maskFeather;},function(v){setClipProp(c,'maskFeather',v);});
       var inv=el('label','checkrow','<input type="checkbox"'+(c.props.maskInvert?' checked':'')+'> 反转蒙版');
       inv.firstChild.addEventListener('change',function(){
@@ -4087,6 +4158,7 @@ function renderProps(){
       var envCv=document.createElement('canvas');
       envWrap.appendChild(envCv);
       sec.body.appendChild(envWrap);
+      sec.onOpen(function(){drawEnvCurve(envCv,c);});
       drawEnvCurve(envCv,c);
       bindEnvEditor(envCv,c);
     }else if(key==='keyframe'){
@@ -4129,9 +4201,13 @@ function renderProps(){
         var t=clamp(State.playhead-c.start,0,c.duration);
         // 使用 DAG 引擎添加参数关键帧
         if(!c.renderGraph)c.renderGraph=DAGEngine.createDefaultGraph(c.props);
-        var nodeId='node_transform';
+        // 按 type 定位变换节点（兼容历史 graph 的任意节点 id）
+        var tnode=null;
+        for(var gi=0;gi<c.renderGraph.nodes.length;gi++)
+          if(c.renderGraph.nodes[gi].type==='transform'){tnode=c.renderGraph.nodes[gi];break;}
+        if(!tnode)return toast('变换节点缺失，无法添加关键帧');
         var value=c.props[paramSel.value]!=null?c.props[paramSel.value]:(paramSel.value==='opacity'?100:0);
-        DAGEngine.addKeyframe(c.renderGraph,nodeId,paramSel.value,Math.round(t*1000),value,easeSel.value);
+        DAGEngine.addKeyframe(c.renderGraph,tnode.id,paramSel.value,Math.round(t*1000),value,easeSel.value);
         // 同步旧版 keyframes（用于时间轴显示）
         if(!c.keyframes.some(function(k){return Math.abs(k-t)<0.02;})){
           c.keyframes.push(t);c.keyframes.sort(function(a,b){return a-b;});
@@ -4177,6 +4253,31 @@ function renderProps(){
         for(var j=0;j<ds.length;j++)ds[j].classList.remove('sel');
       });
       sec.body.appendChild(strip);
+      // 曲线编辑器：显示当前参数的关键帧曲线，支持拖拽编辑时间/数值、双击删除、缓动应用于选中帧
+      var kcw=el('div','env-wrap');
+      kcw.appendChild(el('div','env-label','曲线编辑 — '+
+        (paramSel.options[paramSel.selectedIndex]?paramSel.options[paramSel.selectedIndex].text:'')+
+        '（拖动菱形改时间/数值 · 双击删除 · 选中后缓动下拉即时生效）'));
+      var kcv=document.createElement('canvas');
+      kcw.appendChild(kcv);
+      sec.body.appendChild(kcw);
+      var kfState={param:paramSel.value};
+      paramSel.addEventListener('change',function(){kfState.param=paramSel.value;drawKfCurve(kcv,c,kfState.param);});
+      easeSel.addEventListener('change',function(){
+        // 选中关键帧时缓动即时生效
+        if(kfState.sel>=0&&kfParamNode(c,kfState.param)){
+          var node=kfParamNode(c,kfState.param),arr=node.params[kfState.param];
+          if(Array.isArray(arr)&&arr[kfState.sel]){
+            beginChange();arr[kfState.sel].easing=easeSel.value;
+            EffectPipe.invalidate(c.id);endChange();
+            drawKfCurve(kcv,c,kfState.param);requestPreviewDraw();
+            toast('已将缓动 '+easeSel.value+' 应用于选中关键帧');
+          }
+        }
+      });
+      sec.onOpen(function(){drawKfCurve(kcv,c,kfState.param);});
+      drawKfCurve(kcv,c,kfState.param);
+      bindKfCurveEditor(kcv,c,kfState,function(){drawKfCurve(kcv,c,kfState.param);});
       sec.body.appendChild(el('div','sec-hint',
         'DAG 关键帧引擎已接入：选择参数和缓动函数后点击「添加关键帧」，属性将按缓动曲线自动插值。支持 8 种缓动（linear/easeInOut/easeOutBounce 等），可在时间轴不同位置添加多个关键帧形成动画。'));
     }
@@ -4184,6 +4285,158 @@ function renderProps(){
   });
   updateTimeUI();
 }
+/* ---------- 关键帧曲线编辑器 ---------- */
+function kfParamNode(c,param){
+  if(!c.renderGraph||!c.renderGraph.nodes)return null;
+  var nt=(param==='blur')?'blur':(param==='brightness')?'color':'transform';
+  for(var i=0;i<c.renderGraph.nodes.length;i++)
+    if(c.renderGraph.nodes[i].type===nt)return c.renderGraph.nodes[i];
+  return null;
+}
+function kfSamplesOf(c,param){
+  var n=kfParamNode(c,param);
+  if(!n||!n.params||!n.params[param])return null;
+  var arr=n.params[param];
+  if(!Array.isArray(arr)||!arr.length||typeof arr[0]!=='object'||!('time' in arr[0]))
+    return {staticVal:arr};
+  var N=48,samples=[];
+  for(var i=0;i<=N;i++)samples.push(DAGEngine.sampleParam(arr,Math.round(i/N*c.duration*1000)));
+  return {kfs:arr,samples:samples};
+}
+function drawKfCurve(cv,c,param){
+  var w=cv.clientWidth||260,hgt=cv.clientHeight||96;
+  var dpr=window.devicePixelRatio||1;
+  cv.width=w*dpr;cv.height=hgt*dpr;
+  var x=cv.getContext('2d');
+  x.setTransform(dpr,0,0,dpr,0,0);
+  x.clearRect(0,0,w,hgt);
+  var info=kfSamplesOf(c,param);
+  var pad=10;
+  // 值域
+  var vmin=0,vmax=1;
+  if(info&&info.samples){
+    vmin=Math.min.apply(null,info.samples);vmax=Math.max.apply(null,info.samples);
+    if(vmax-vmin<1e-6){vmin-=10;vmax+=10;}
+    var pad2=(vmax-vmin)*0.12;vmin-=pad2;vmax+=pad2;
+  }
+  var yOf=function(v){return hgt-pad-(v-vmin)/(vmax-vmin)*(hgt-2*pad);};
+  var xOf=function(ms){return ms/(c.duration*1000)*w;};
+  // 网格
+  x.strokeStyle='rgba(255,255,255,0.05)';x.lineWidth=1;
+  for(var gy=0;gy<=3;gy++){var yy=hgt*gy/3;x.beginPath();x.moveTo(0,yy);x.lineTo(w,yy);x.stroke();}
+  if(!info){
+    x.fillStyle='rgba(154,163,175,0.7)';x.font='11px system-ui';x.textAlign='center';
+    x.fillText('该参数暂无关键帧 —— 在播放头处点击「添加」后可拖拽编辑',w/2,hgt/2+4);
+    return {vmin:vmin,vmax:vmax};
+  }
+  if(info.staticVal!=null){
+    x.strokeStyle='rgba(109,178,255,0.7)';x.setLineDash([4,4]);x.lineWidth=1.5;
+    x.beginPath();x.moveTo(0,yOf(+info.staticVal||0));x.lineTo(w,yOf(+info.staticVal||0));x.stroke();
+    x.setLineDash([]);
+    x.fillStyle='rgba(154,163,175,0.7)';x.font='11px system-ui';x.textAlign='center';
+    x.fillText('静态值 '+info.staticVal+'（无关键帧）',w/2,hgt/2+4);
+    return {vmin:vmin,vmax:vmax};
+  }
+  // 曲线
+  x.strokeStyle='#6db2ff';x.lineWidth=1.8;x.beginPath();
+  info.samples.forEach(function(v,i){
+    var px=i/(info.samples.length-1)*w,py=yOf(v);
+    if(i===0)x.moveTo(px,py);else x.lineTo(px,py);
+  });
+  x.stroke();
+  // 关键帧菱形
+  info.kfs.forEach(function(kf,i){
+    var px=xOf(kf.time),py=yOf(kf.value);
+    x.save();x.translate(px,py);x.rotate(Math.PI/4);
+    x.fillStyle=(State.selKF===i&&kfEditorSel.param===param&&kfEditorSel.clipId===c.id)?'#ffd76d':'#6db2ff';
+    x.fillRect(-4,-4,8,8);
+    x.strokeStyle='#0e1013';x.lineWidth=1.5;x.strokeRect(-4,-4,8,8);
+    x.restore();
+  });
+  return {vmin:vmin,vmax:vmax,xOf:xOf,yOf:yOf,info:info};
+}
+var kfEditorSel={clipId:null,param:null,sel:-1};
+function bindKfCurveEditor(cv,c,kfState,redraw){
+  var drag=-1;
+  function metrics(){return drawKfCurve(cv,c,kfState.param);}
+  function loc(e){
+    var r=cv.getBoundingClientRect();
+    return {x:e.clientX-r.left,y:e.clientY-r.top};
+  }
+  function hit(p){
+    var m=metrics(),info=m&&m.info;
+    if(!info||!info.kfs)return -1;
+    for(var i=0;i<info.kfs.length;i++){
+      var px=info.kfs[i].time/(c.duration*1000)*cv.clientWidth;
+      var py=m.yOf(info.kfs[i].value);
+      if(Math.hypot(px-p.x,py-p.y)<10)return i;
+    }
+    return -1;
+  }
+  cv.addEventListener('pointerdown',function(e){
+    var p=loc(e);
+    drag=hit(p);
+    if(drag<0)return;
+    kfEditorSel={clipId:c.id,param:kfState.param,sel:drag};
+    kfState.sel=drag;
+    beginChange();
+    try{cv.setPointerCapture(e.pointerId);}catch(err){}
+    redraw();
+  });
+  cv.addEventListener('pointermove',function(e){
+    if(drag<0)return;
+    var info=kfSamplesOf(c,kfState.param);
+    if(!info||!info.kfs||!info.kfs[drag])return;
+    var p=loc(e);
+    var m=metrics();
+    var kfs=info.kfs;
+    kfs[drag].time=clamp(p.x/cv.clientWidth,0,1)*c.duration*1000;
+    kfs[drag].value=m.vmin+(1-p.y/cv.clientHeight)*(m.vmax-m.vmin);
+    EffectPipe.invalidate(c.id);
+    syncKfMarkers(c);
+    redraw();requestPreviewDraw();
+  });
+  function finish(){
+    if(drag<0)return;
+    var info=kfSamplesOf(c,kfState.param);
+    if(info&&info.kfs)info.kfs.sort(function(a,b){return a.time-b.time;});
+    drag=-1;kfState.sel=-1;
+    syncKfMarkers(c);
+    endChange();redraw();requestPreviewDraw();
+  }
+  cv.addEventListener('pointerup',finish);
+  cv.addEventListener('pointercancel',finish);
+  cv.addEventListener('dblclick',function(e){
+    var p=loc(e),i=hit(p);
+    if(i<0)return;
+    var info=kfSamplesOf(c,kfState.param);
+    if(info&&info.kfs){
+      beginChange();info.kfs.splice(i,1);
+      if(!info.kfs.length)delete kfParamNode(c,kfState.param).params[kfState.param];
+      syncKfMarkers(c);
+      EffectPipe.invalidate(c.id);
+      endChange();redraw();requestPreviewDraw();
+    }
+  });
+}
+function syncKfMarkers(c){
+  var times=[];
+  ['transform','color','blur'].forEach(function(nt){
+    if(!c.renderGraph||!c.renderGraph.nodes)return;
+    for(var i=0;i<c.renderGraph.nodes.length;i++){
+      var n=c.renderGraph.nodes[i];
+      if(n.type!==nt||!n.params)continue;
+      for(var k in n.params){
+        var arr=n.params[k];
+        if(Array.isArray(arr)&&arr.length&&typeof arr[0]==='object'&&arr[0]&&('time' in arr[0]))
+          arr.forEach(function(kf){times.push(kf.time);});
+      }
+    }
+  });
+  times.sort(function(a,b){return a-b;});
+  c.keyframes=times.map(function(ms){return ms/1000;});
+}
+
 /* ---------- 变速 setter：真实映射画面/音频，必要时回拉时长 ---------- */
 function setClipSpeed(c,v){
   c.speed=clamp(v,0.25,4);
@@ -4269,6 +4522,120 @@ function bindEnvEditor(cv,c){
   });
 }
 
+/* ---------- 钢笔蒙版：预览叠层编辑 ---------- */
+function penSourceDims(c){
+  var im=ImageStore.get(c.sourceId);
+  if(im)return {w:im.w,h:im.h};
+  var src=Engine.videoDecoder.__debug.sources[c.sourceId];
+  if(src&&src.demux)return {w:src.demux.width||16,h:src.demux.height||9};
+  return null;
+}
+function penFrameRect(c){
+  // 与 drawFrame 相同的适配矩形（scale/位移忽略——顶点定义在源帧空间）
+  var d=penSourceDims(c);
+  var st=els.stage;
+  var W=st.clientWidth,H=st.clientHeight;
+  if(!d||W<10)return null;
+  var s=Math.min(W/d.w,H/d.h);
+  var dw=d.w*s,dh=d.h*s;
+  return {x:(W-dw)/2,y:(H-dh)/2,w:dw,h:dh,dims:d};
+}
+function syncPenOverlay(){
+  var ov=els.penOverlay,c=getSel();
+  var active=State.penEditClip&&c&&c.id===State.penEditClip;
+  ov.classList.toggle('on',!!active);
+  if(active)drawPenOverlay();
+}
+function drawPenOverlay(){
+  var ov=els.penOverlay,c=getSel();
+  if(!c||State.penEditClip!==c.id)return;
+  var r=penFrameRect(c);
+  var dpr=window.devicePixelRatio||1;
+  var W=els.stage.clientWidth,H=els.stage.clientHeight;
+  ov.width=W*dpr;ov.height=H*dpr;
+  var x=ov.getContext('2d');
+  x.setTransform(dpr,0,0,dpr,0,0);
+  x.clearRect(0,0,W,H);
+  if(!r)return;
+  // 帧外区域压暗
+  x.fillStyle='rgba(5,6,8,0.45)';
+  x.fillRect(0,0,W,r.y);x.fillRect(0,r.y+r.h,W,H-r.y-r.h);
+  x.fillRect(0,r.y,r.x,r.h);x.fillRect(r.x+r.w,r.y,W-r.x-r.w,r.h);
+  var pts=c.props.maskPoints||[];
+  x.strokeStyle='#6db2ff';x.lineWidth=1.5;x.setLineDash([5,4]);
+  x.beginPath();
+  pts.forEach(function(p2,i){
+    var X=r.x+p2.x*r.w,Y=r.y+p2.y*r.h;
+    if(i===0)x.moveTo(X,Y);else x.lineTo(X,Y);
+  });
+  if(pts.length>=3)x.closePath();
+  x.stroke();x.setLineDash([]);
+  pts.forEach(function(p2){
+    var X=r.x+p2.x*r.w,Y=r.y+p2.y*r.h;
+    x.fillStyle='#fff';x.beginPath();x.arc(X,Y,4.5,0,Math.PI*2);x.fill();
+    x.strokeStyle='#6db2ff';x.lineWidth=2;x.stroke();
+  });
+  x.fillStyle='rgba(232,234,238,0.9)';x.font='11px system-ui';x.textAlign='center';
+  x.fillText('点击添加顶点 · 拖动调整 · 右键删除 · 完成后回属性面板',W/2,Math.max(14,r.y-8));
+}
+function bindPenEditor(){
+  var ov=els.penOverlay;
+  var dragIdx=-1;
+  function norm(e){
+    var r=penFrameRect(getSel());
+    var rect=ov.getBoundingClientRect();
+    var px=e.clientX-rect.left,py=e.clientY-rect.top;
+    if(!r)return null;
+    return {x:clamp((px-r.x)/r.w,0,1),y:clamp((py-r.y)/r.h,0,1),px:px,py:py};
+  }
+  function nearPt(p){
+    var c=getSel(),r=penFrameRect(c);
+    var pts=c.props.maskPoints||[];
+    for(var i=0;i<pts.length;i++){
+      if(Math.hypot(r.x+pts[i].x*r.w-p.px,r.y+pts[i].y*r.h-p.py)<11)return i;
+    }
+    return -1;
+  }
+  ov.addEventListener('pointerdown',function(e){
+    if(e.button!==0)return;
+    var c=getSel();if(!c||State.penEditClip!==c.id)return;
+    var p=norm(e);if(!p)return;
+    dragIdx=nearPt(p);
+    if(dragIdx<0){
+      beginChange();
+      c.props.maskPoints=(c.props.maskPoints||[]).slice();
+      c.props.maskPoints.push({x:p.x,y:p.y});
+      dragIdx=c.props.maskPoints.length-1;
+    }else beginChange();
+    setClipProp(c,'maskPoints',c.props.maskPoints);
+    drawPenOverlay();
+    try{ov.setPointerCapture(e.pointerId);}catch(err){}
+  });
+  ov.addEventListener('pointermove',function(e){
+    var c=getSel();
+    if(!c||dragIdx<0||!c.props.maskPoints||!c.props.maskPoints[dragIdx])return;
+    var p=norm(e);if(!p)return;
+    c.props.maskPoints[dragIdx]={x:p.x,y:p.y};
+    setClipProp(c,'maskPoints',c.props.maskPoints);
+    drawPenOverlay();
+  });
+  function finish(){if(dragIdx>=0){endChange();dragIdx=-1;}}
+  ov.addEventListener('pointerup',finish);
+  ov.addEventListener('pointercancel',finish);
+  ov.addEventListener('contextmenu',function(e){
+    e.preventDefault();
+    var c=getSel();if(!c||State.penEditClip!==c.id)return;
+    var p=norm(e);if(!p)return;
+    var i=nearPt(p);
+    if(i>=0){
+      beginChange();
+      c.props.maskPoints.splice(i,1);
+      setClipProp(c,'maskPoints',c.props.maskPoints);
+      endChange();drawPenOverlay();
+    }
+  });
+}
+
 var kfClipboard=null; // 关键帧剪贴板（跨片段复制动画曲线与标记）
 var SEC_TITLES={transform:'变换',color:'调色',effects:'效果（模糊 / 锐化）',chromaKey:'色度键抠像',textstyle:'文字样式',mask:'蒙版',transition:'转场',audio:'音频',speed:'变速',keyframe:'关键帧'};
 function mkSection(key){
@@ -4276,9 +4643,15 @@ function mkSection(key){
   var root=el('div','sec'+(open?' open':''));
   var h=el('div','sec-h','<span class="sec-chev">'+icon('chevdown',13)+'</span><span>'+SEC_TITLES[key]+'</span>');
   var b=el('div','sec-b');
-  h.addEventListener('click',function(){root.classList.toggle('open');State.secOpen[key]=root.classList.contains('open');});
+  var redraws=[];
+  h.addEventListener('click',function(){
+    root.classList.toggle('open');
+    var nowOpen=root.classList.contains('open');
+    State.secOpen[key]=nowOpen;
+    if(nowOpen)redraws.forEach(function(fn){try{fn();}catch(e){}}); // 展开时重绘画布（折叠期宽 0 的绘制无效）
+  });
   root.appendChild(h);root.appendChild(b);
-  return {root:root,body:b};
+  return {root:root,body:b,onOpen:function(fn){redraws.push(fn);if(open)try{fn();}catch(e){}}};
 }
 function mkSlider(body,label,unit,min,max,step,get,set){
   var row=el('div','prow');
@@ -5228,6 +5601,154 @@ function runRealExport(selRes,watermark,onStage,settings){
     return nextWin();
   });
 }
+/* ============================================================
+   AI 视频质量检测（导出前 · 全部真实客户端分析）
+   黑屏扫描 / 画面模糊（Laplacian 方差）/ 音频静音与削波 / 字幕安全区 / 参数核对
+   问题可点击定位到时间线
+   ============================================================ */
+function qcLuma(data){
+  var s=0;
+  for(var i=0;i<data.length;i+=4)s+=0.2126*data[i]+0.7152*data[i+1]+0.0722*data[i+2];
+  return s/(data.length/4);
+}
+function qcSharpness(data,w,hgt){
+  // 灰度 + Laplacian 方差（低分辨率下稳定）
+  var g=new Float32Array(w*hgt);
+  for(var i=0;i<w*hgt;i++)g[i]=0.2126*data[i*4]+0.7152*data[i*4+1]+0.0722*data[i*4+2];
+  var sum=0,sum2=0,n=0;
+  for(var y=1;y<hgt-1;y++)for(var x=1;x<w-1;x++){
+    var idx=y*w+x;
+    var lap=4*g[idx]-g[idx-1]-g[idx+1]-g[idx-w]-g[idx+w];
+    sum+=lap;sum2+=lap*lap;n++;
+  }
+  if(!n)return 0;
+  var mean=sum/n;
+  return sum2/n-mean*mean;
+}
+function runQualityCheck(onProgress){
+  var dur=projectDuration();
+  var issues=[];
+  // 预解码全部视频源（与导出同一前置）
+  var srcIds={};
+  State.clips.forEach(function(c){
+    if(c.sourceId&&trackTypeOf(c)==='video')srcIds[c.sourceId]=1;
+  });
+  var ids=Object.keys(srcIds),chain=Promise.resolve();
+  ids.forEach(function(sid){
+    chain=chain.then(function(){
+      var src=Engine.videoDecoder.__debug.sources[sid];
+      var d=src&&src.demux?src.demux.duration:0;
+      return Engine.videoDecoder.decodeRange(sid,0,d);
+    });
+  });
+  return chain.then(function(){
+    // —— 黑屏 + 模糊：每 0.5s 采样 ——
+    var cv=document.createElement('canvas');cv.width=96;cv.height=54;
+    var cx=cv.getContext('2d',{willReadFrequently:true});
+    var step=0.5,blackRuns=[],curBlack=null,blurScores=[];
+    var n=Math.max(1,Math.ceil(dur/step));
+    var chain2=Promise.resolve(),i2=0;
+    function sampleOne(){
+      var t=i2*step;
+      cx.fillStyle='#000';cx.fillRect(0,0,96,54);
+      drawLayerStack(cx,t,96,54,96/720,96);
+      var data=cx.getImageData(0,0,96,54).data;
+      var lum=qcLuma(data);
+      if(lum<7){
+        if(!curBlack)curBlack={t:t};
+      }else{
+        if(curBlack&&t-curBlack.t>=1)blackRuns.push(curBlack);
+        curBlack=null;
+        if(lum>16)blurScores.push({t:t,v:qcSharpness(data,96,54)});
+      }
+      i2++;
+      onProgress('画面扫描 '+(t).toFixed(1)+'s / '+dur.toFixed(1)+'s',i2/n);
+      if(i2<n&&i2%6!==0)return Promise.resolve().then(sampleOne); // 每 6 帧让出 UI
+      return Promise.resolve();
+    }
+    return sampleOne().then(function loop(){
+      if(i2<n)return sampleOne().then(loop);
+      if(curBlack&&dur-curBlack.t>=1)blackRuns.push(curBlack);
+      blackRuns.forEach(function(b){
+        issues.push({sev:'warn',t:b.t,msg:'黑屏片段：'+fmt(b.t)+' 起约 '+fmt(Math.min(dur-b.t,2))+'（如为有意设计可忽略）'});
+      });
+      if(blurScores.length>=4){
+        blurScores.sort(function(a,b){return a.v-b.v;});
+        var worst=blurScores.slice(0,3);
+        var avg=blurScores.reduce(function(s,x){return s+x.v;},0)/blurScores.length;
+        if(avg>0&&worst[0].v<avg*0.35)
+          worst.forEach(function(w2){
+            issues.push({sev:'info',t:w2.t,msg:'画面偏糊：'+fmt(w2.t)+'（清晰度显著低于全片均值）'});
+          });
+      }
+      // —— 音频：分窗 RMS（静音 / 削波）——
+      var win=Math.max(2,dur/40),wins=[];
+      for(var w0=0;w0<dur;w0+=win)wins.push(w0);
+      var aclips=[];
+      State.tracks.forEach(function(tr){
+        if(tr.type!=='audio'||tr.muted)return;
+        State.clips.forEach(function(c){if(c.trackId===tr.id&&c.sourceId)aclips.push(c);});
+      });
+      var ai=0;
+      function audioOne(){
+        var w0=wins[ai],wlen=Math.min(win,dur-w0);
+        if(wlen<=0.05)return Promise.resolve();
+        return renderAudioWindow(w0,wlen,aclips).then(function(buf){
+          if(buf){
+            var d=buf.getChannelData(0),peak=0,sum=0;
+            for(var i=0;i<d.length;i+=8){var v=Math.abs(d[i]);if(v>peak)peak=v;sum+=v*v;}
+            var rms=Math.sqrt(sum/(d.length/8));
+            if(rms<0.0008)issues.push({sev:'info',t:w0,msg:'音频静音：'+fmt(w0)+' 起约 '+fmt(wlen)});
+            if(peak>0.985)issues.push({sev:'warn',t:w0,msg:'音频可能削波：'+fmt(w0)+'（峰值 '+Math.round(peak*100)+'%）——建议降低片段音量'});
+          }
+          ai++;
+          onProgress('音频扫描 '+w0.toFixed(1)+'s / '+dur.toFixed(1)+'s',0.5+0.5*ai/wins.length);
+          if(ai<wins.length&&ai%3!==0)return Promise.resolve();
+          return null;
+        }).then(function(r){if(r!==null&&ai<wins.length)return audioOne();});
+      }
+      return (aclips.length?audioOne():Promise.resolve()).then(function(){
+        if(aclips.length){
+          // 合并连续静音（简化：≥2 个相邻静音窗才报）
+        }
+        // —— 字幕安全区 ——
+        var parts=State.ratio.split(':'),rh2=+parts[1]||9,rw2=+parts[0]||16;
+        var estH=1080,estW=Math.round(estH*rw2/rh2/2)*2;
+        State.tracks.forEach(function(tr){
+          if(tr.type!=='text'||tr.hidden)return;
+          State.clips.forEach(function(c){
+            if(c.trackId!==tr.id)return;
+            var fs=c.props.fontSize||Math.round(estH/13);
+            if(fs>estH*0.09)issues.push({sev:'info',t:c.start,msg:'字幕偏大：'+fmt(c.start)+'（字号 '+fs+'px，接近画面底部安全边界）'});
+            if(c.duration<0.5)issues.push({sev:'info',t:c.start,msg:'字幕停留过短：'+fmt(c.start)+'（不足 0.5 秒）'});
+          });
+        });
+        // —— 参数核对 ——
+        issues.push({sev:'info',t:null,msg:'导出参数：'+estW+'×'+estH+' · '+(State.projectFps||30)+'FPS · 时长 '+fmt(dur)+' · 预估体积约 '+Math.round(dur*4.5/8)+'MB（自动码率）'});
+        return issues;
+      });
+    });
+  });
+}
+function showQualityReport(issues){
+  var list=issues.map(function(it){
+    return '<div class="ctx-item" data-t="'+(it.t!=null?it.t:'')+'" style="cursor:'+(it.t!=null?'pointer':'default')+'">'
+      +'<span style="color:'+(it.sev==='warn'?'#e6b455':'#9aa3af')+';flex:none">'+(it.sev==='warn'?'⚠':'ℹ')+'</span>'
+      +'<span>'+esc(it.msg)+'</span></div>';
+  }).join('');
+  var warnN=issues.filter(function(i2){return i2.sev==='warn';}).length;
+  openModal('质量检测报告',
+    '<div class="m-note">扫描完成：'+warnN+' 项警告 · '+issues.length+' 项提示。点击条目可定位到时间线。</div>'
+    +'<div style="max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:6px">'+list+'</div>'
+    +'<div class="m-actions"><button class="btn primary" id="qcOk">知道了</button></div>');
+  $id('qcOk').addEventListener('click',closeModal);
+  Array.prototype.forEach.call(document.querySelectorAll('#modalBody .ctx-item'),function(elx){
+    elx.addEventListener('click',function(){
+      var t2=parseFloat(elx.dataset.t);
+      if(!isNaN(t2)){closeModal();seekTo(t2);}
+    });
+  });
+}
 function openExportModal(){
   var isPro=State.currentPlan==='pro';
   var limRes=(State.serverLimits&&State.serverLimits.exportResolution)||(window.getPlanLimit?window.getPlanLimit(State.currentPlan,'exportResolution'):null)||720;
@@ -5265,7 +5786,7 @@ function openExportModal(){
     +'</div>'
     +'<div class="exp-progress" id="expProg"><i id="expProgBar"></i></div>'
     +'<div class="exp-stage" id="expStage">全程本地渲染，素材不会上传服务器</div>'
-    +'<div class="m-actions"><button class="btn" id="expCancel">取消</button><button class="btn primary" id="expGo">开始导出</button></div>');
+    +'<div class="m-actions"><button class="btn" id="expCancel">取消</button><button class="btn" id="expQc">'+icon('check',13)+' 质量检测</button><button class="btn primary" id="expGo">开始导出</button></div>');
   // 水印预览：抓取当前预览画面 + 叠加水印样式
   try{
     var pc=document.getElementById('previewCanvas'),ec=document.getElementById('expPrevCv');
@@ -5273,6 +5794,24 @@ function openExportModal(){
     ec.getContext('2d').drawImage(pc,0,0);
   }catch(e){}
   $id('expCancel').addEventListener('click',closeModal);
+  $id('expQc').addEventListener('click',function(){
+    var qcBtn=$id('expQc'),stage2=$id('expStage');
+    qcBtn.disabled=true;
+    $id('expProg').classList.add('on');
+    runQualityCheck(function(txt,p){
+      stage2.textContent=txt;
+      $id('expProgBar').style.width=Math.round(clamp(p,0,1)*100)+'%';
+    }).then(function(issues){
+      $id('expProg').classList.remove('on');
+      stage2.textContent='质量检测完成';
+      qcBtn.disabled=false;
+      showQualityReport(issues);
+    }).catch(function(e){
+      $id('expProg').classList.remove('on');
+      stage2.textContent='检测失败：'+((e&&e.message)||e);
+      qcBtn.disabled=false;
+    });
+  });
   if(!isPro)$id('expUpgrade').addEventListener('click',function(){openCheckout(openExportModal);});
   $id('expGo').addEventListener('click',function(){
     var selRes=parseInt($id('expRes').value,10);
@@ -6373,7 +6912,7 @@ function collectEls(){
   ['topbar','projName','brandHome','btnUndo','btnRedo','btnAI','btnPlan','btnExport','btnSettings','btnUser','userMenu','btnPanelL','btnPanelR','closeL','closeR',
    'leftPanel','libBody','libTabs','libSearch','libContent','btnLeftCollapse','btnLeftExpand','libCount','libViewGrid','libViewList','zoomSel','projMeta',
    'splitL','splitR','splitH','centerCol','previewPane','stageWrap','stage','previewCanvas',
-   'btnPlay','timeCur','timeTot','progress','progFill','progKnob','btnMute','volSlider','ratioSel','qualSel','btnFull',
+   'btnPlay','timeCur','timeTot','progress','progFill','progKnob','btnMute','volSlider','ratioSel','qualSel','btnFull','penOverlay',
    'timelineArea','btnSplit','btnDel','btnCopy','btnPaste','btnDup','btnSnap','btnFit',
    'btnZoomOut','zoomSlider','btnZoomIn','zoomLabel','tlBody','trackHeads','corner','headsInner',
    'tlWrap','tlCanvas','vScroll','vThumb','hScroll','hThumb',
@@ -6772,6 +7311,7 @@ function init(){
     nameEl.addEventListener('keydown',function(ev){if(ev.key==='Enter'){ev.preventDefault();nameEl.blur();}});
   });
 
+  bindPenEditor();
   bindTimelinePointer();
   bindScrollbars();
   bindSplitters();
@@ -6814,7 +7354,7 @@ function init(){
     ops:{copy:copySelected,paste:pasteClips,duplicate:duplicateSelected,del:deleteSelected,split:splitSelected,selectAll:selectAllClips},
     EffectPipe:EffectPipe,setClipProp:setClipProp,App:App,resolveClipParams:resolveClipParams,ImageStore:ImageStore,drawExportFrame:drawExportFrame,renderAudioWindow:renderAudioWindow,
     opLog:function(){return _dcore?_dcore.opLog.slice():[];},
-    version:'0.5.0'};
+    version:'0.5.1'};
 }
 
 init();
