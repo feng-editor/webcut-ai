@@ -78,6 +78,21 @@ print('Model:', WANX_MODEL)
 print('======================')
 
 
+def _translate_upstream_error(text):
+    """把阿里云原始错误翻译成用户可操作的提示（不泄露内部细节）"""
+    t = text or ''
+    if 'InvalidApiKey' in t or 'Invalid API-key' in t:
+        return ('API Key 已失效或被轮换——请在阿里云百炼控制台 (bailian.console.aliyun.com) '
+                '重新生成 API-KEY，更新 ai-backend/.env 的 DASHSCOPE_API_KEY 后重启后端')
+    if 'Throttling' in t or 'RateLimit' in t:
+        return ('请求过于频繁（上游限流）——请稍等 1-2 分钟后重试')
+    if 'Arrearage' in t or '欠费' in t:
+        return ('账户欠费或额度用尽——请在阿里云费用中心检查百炼服务余额')
+    if 'ModelNotExist' in t or 'UnsupportedOperation' in t:
+        return ('当前工作区不支持该模型——请在百炼控制台确认模型开通状态')
+    return None
+
+
 # ============================================================
 # 健康检查
 # ============================================================
@@ -143,7 +158,8 @@ def create_video_task():
 
         if resp.status_code != 200:
             print(f'>>> [AI] 错误响应: {resp.text[:300]} <<<', flush=True)
-            return jsonify({'error': f'阿里云返回 {resp.status_code}: {resp.text[:200]}'}), 502
+            human = _translate_upstream_error(resp.text)
+            return jsonify({'error': human or f'阿里云返回 {resp.status_code}: {resp.text[:200]}'}), 502
 
         j = resp.json()
         task_id = (j.get('output') or {}).get('task_id')
@@ -288,7 +304,8 @@ def create_image_task():
         resp = req_lib.post(url, headers=headers, json=payload, timeout=30)
         print(f'>>> [T2I] 阿里云返回: {resp.status_code} <<<', flush=True)
         if resp.status_code != 200:
-            return jsonify({'error': f'阿里云返回 {resp.status_code}: {resp.text[:200]}'}), 502
+            human = _translate_upstream_error(resp.text)
+            return jsonify({'error': human or f'阿里云返回 {resp.status_code}: {resp.text[:200]}'}), 502
         task_id = (resp.json().get('output') or {}).get('task_id')
         if not task_id:
             return jsonify({'error': '未返回 task_id'}), 502
@@ -395,7 +412,8 @@ def enhance_prompt():
         }
         resp = req_lib.post(url, headers=headers, json=payload, timeout=60)
         if resp.status_code != 200:
-            return jsonify({'error': f'阿里云返回 {resp.status_code}: {resp.text[:200]}'}), 502
+            human = _translate_upstream_error(resp.text)
+            return jsonify({'error': human or f'阿里云返回 {resp.status_code}: {resp.text[:200]}'}), 502
         txt = (((resp.json().get('output') or {}).get('choices') or [{}])[0].get('message') or {}).get('content')
         if not txt:
             return jsonify({'error': '模型未返回内容'}), 502

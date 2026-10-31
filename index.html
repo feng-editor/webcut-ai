@@ -5129,7 +5129,14 @@ function aiProgress(main){
     prog:prog,bar:prog.firstChild,st:st,err:err,prev:prev,act:act,
     show(p,txt){prog.classList.add('on');prog.firstChild.style.width=Math.round(clamp(p,0,1)*100)+'%';st.textContent=txt;},
     hide(){prog.classList.remove('on');st.textContent='';},
-    fail(msg){this.hide();err.textContent=msg;err.classList.add('on');},
+    fail(msg){
+      this.hide();
+      var guide='';
+      if(/API Key 已失效|重新生成 API-KEY/.test(msg))guide='→ 更新 ai-backend/.env 的 DASHSCOPE_API_KEY 并重启后端即可恢复（本地抠像/增强/调色/导出不受影响）';
+      else if(/限流/.test(msg))guide='→ 上游限流中，建议 1-2 分钟后重试';
+      err.textContent=msg+(guide?' '+guide:'');
+      err.classList.add('on');
+    },
     clearErr(){err.classList.remove('on');err.textContent='';},
     preview(blob,isVideo){
       prev.style.display='block';prev.innerHTML='';
