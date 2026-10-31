@@ -78,6 +78,60 @@ print('Model:', WANX_MODEL)
 print('======================')
 
 
+# ============================================================
+# API 限流（令牌桶，按 IP）—— 防止公网刷接口烧 DashScope 按量额度
+# 额度（真实成本约束）：视频生成是最贵操作，严格限
+# ============================================================
+import collections
+
+_RATE_RULES = {  # 端点前缀 → (次数, 窗口秒)
+    '/api/ai/video': (2, 600),      # 2 次 / 10 分钟
+    '/api/ai/image': (6, 600),      # 6 次 / 10 分钟
+    '/api/ai/tts': (10, 600),       # 10 次 / 10 分钟
+    '/api/ai/prompt': (30, 600),    # 30 次 / 10 分钟
+}
+_rate_hits = collections.defaultdict(collections.deque)  # (ip, prefix) → [timestamps]
+_rate_lock = threading.Lock()
+
+def _rate_check():
+    """命中限流返回 (True, 重试等待秒)；否则记录并返回 (False, 0)"""
+    path = request.path
+    rule = None
+    for prefix, cfg2 in _RATE_RULES.items():
+        if path.startswith(prefix):
+            rule = cfg2
+            break
+    if not rule:
+        return (False, 0)
+    ip = (request.headers.get('X-Forwarded-For') or request.remote_addr or 'unknown').split(',')[0].strip()
+    limit, window = rule
+    now = time.time()
+    key = (ip, prefix)
+    with _rate_lock:
+        dq = _rate_hits[key]
+        while dq and dq[0] <= now - window:
+            dq.popleft()
+        if len(dq) >= limit:
+            retry = int(window - (now - dq[0])) + 1
+            return (True, retry)
+        dq.append(now)
+        # 防内存膨胀：全表过大时清理空队列
+        if len(_rate_hits) > 4096:
+            for k in [k2 for k2, v in _rate_hits.items() if not v]:
+                _rate_hits.pop(k, None)
+    return (False, 0)
+
+
+@app.before_request
+def _enforce_rate_limit():
+    hit, retry = _rate_check()
+    if hit:
+        resp = jsonify({'error': f'请求过于频繁（限流：每 10 分钟内该类操作有次数上限），请约 {retry} 秒后重试'})
+        resp.status_code = 429
+        resp.headers['Retry-After'] = str(retry)
+        return resp
+
+
 def _translate_upstream_error(text):
     """把阿里云原始错误翻译成用户可操作的提示（不泄露内部细节）"""
     t = text or ''

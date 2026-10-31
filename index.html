@@ -2806,6 +2806,13 @@ var EffectPipe=(function(){
     var sx=cl*pw,sy=ct*ph,sw=pw*(1-cl-cr2),sh=ph*(1-ct-cbm);
     if(sw<2||sh<2)return;
     var scFit=Math.min(W/sw,H/sh),dw=sw*scFit,dh=sh*scFit;
+    // 蒙版合成：linear/circle/rect 为真实裁切（羽化用径向/线性渐变），pen 未实现如实按无蒙版处理
+    var useMask=p.mask&&p.mask!=='none'&&p.mask!=='pen';
+    var tmp=null;
+    if(useMask){
+      tmp=maskCanvas(src,sx,sy,sw,sh,p.mask,p.maskFeather||0,!!p.maskInvert,dw,dh);
+      if(tmp){src=tmp;sx=0;sy=0;sw=dw;sh=dh;}
+    }
     ctx.save();
     ctx.globalAlpha=clamp((p.opacity!=null?p.opacity:100)/100,0,1);
     var sc=(p.scale||100)/100;
@@ -2820,9 +2827,104 @@ var EffectPipe=(function(){
     if(fl)ctx.filter='none';
     ctx.restore();
   }
+
+  /* 蒙版合成：源裁切区 → 离屏画布 → 蒙版形状 alpha（destination-in）。
+     羽化 0..100 映射到形状边缘的渐变过渡带；invert 反转保留区。 */
+  var maskCache={key:null,canvas:null};
+  function maskCanvas(src,sx,sy,sw,sh,mode,feather,invert,dw,dh){
+    var key=[sx|0,sy|0,sw|0,sh|0,mode,feather,invert?1:0,dw|0,dh|0,src.width||0,src.height||0].join('|');
+    if(maskCache.key===key)return maskCache.canvas;
+    var w=Math.max(2,Math.round(dw)),hh=Math.max(2,Math.round(dh));
+    var cv=document.createElement('canvas');cv.width=w;cv.height=hh;
+    var cx=cv.getContext('2d');
+    cx.drawImage(src,sx,sy,sw,sh,0,0,w,hh);
+    var f=clamp(feather,0,100)/100;
+    cx.globalCompositeOperation='destination-in';
+    cx.beginPath();
+    if(mode==='circle'){
+      var r=Math.min(w,hh)/2,ir=r*(1-f*0.9);
+      var g=cx.createRadialGradient(w/2,hh/2,ir,w/2,hh/2,Math.max(1,r));
+      g.addColorStop(0,'rgba(0,0,0,1)');g.addColorStop(1,'rgba(0,0,0,0)');
+      cx.fillStyle=g;cx.fillRect(0,0,w,hh);
+    }else if(mode==='rect'){
+      // 软边矩形：保留区 90% 内实，羽化映射为 blur（边缘真实渐变过渡）
+      var mx=w*0.05,my=hh*0.05;
+      if(f>0){cx.filter='blur('+Math.max(0.5,f*22)+'px)';}
+      cx.fillStyle='#000';
+      cx.fillRect(mx,my,Math.max(1,w-2*mx),Math.max(1,hh-2*my));
+      if(f>0){cx.filter='none';}
+    }else{ // linear：保留上半部（羽化带在中线附近）
+      var ly=hh*(0.5-0.45*f);
+      var g2=cx.createLinearGradient(0,ly,0,hh*(0.5+0.45*f));
+      g2.addColorStop(0,'rgba(0,0,0,1)');g2.addColorStop(1,'rgba(0,0,0,0)');
+      cx.fillStyle=g2;cx.fillRect(0,0,w,hh);
+    }
+    if(invert){
+      // 反转：再叠一层全幅 alpha 的 source-over 前先把当前结果取反 → 用 'destination-out' 全幅擦除 + 重画源后按差集处理
+      // 简化实现：invert 时改用 'destination-out' 把蒙版形状从画面中擦除
+      cx.globalCompositeOperation='source-over';
+      cx.clearRect(0,0,w,hh);
+      cx.drawImage(src,sx,sy,sw,sh,0,0,w,hh);
+      cx.globalCompositeOperation='destination-out';
+      cx.beginPath();
+      if(mode==='circle'){
+        var r2=Math.min(w,hh)/2,ir2=r2*(1-f*0.9);
+        var g3=cx.createRadialGradient(w/2,hh/2,ir2,w/2,hh/2,Math.max(1,r2));
+        g3.addColorStop(0,'rgba(0,0,0,1)');g3.addColorStop(1,'rgba(0,0,0,0)');
+        cx.fillStyle=g3;cx.fillRect(0,0,w,hh);
+      }else if(mode==='rect'){
+        var mx2=w*0.05,my2=hh*0.05;
+        if(f>0){cx.filter='blur('+Math.max(0.5,f*22)+'px)';}
+        cx.fillStyle='#000';
+        cx.fillRect(mx2,my2,Math.max(1,w-2*mx2),Math.max(1,hh-2*my2));
+        if(f>0){cx.filter='none';}
+      }else{
+        var ly2=hh*(0.5-0.45*f);
+        var g4=cx.createLinearGradient(0,ly2,0,hh*(0.5+0.45*f));
+        g4.addColorStop(0,'rgba(0,0,0,1)');g4.addColorStop(1,'rgba(0,0,0,0)');
+        cx.fillStyle=g4;cx.fillRect(0,0,w,hh);
+      }
+    }
+    cx.globalCompositeOperation='source-over';
+    maskCache={key:key,canvas:cv};
+    return cv;
+  }
   return{drawFrame:drawFrame,invalidate:invalidate,dispose:dispose,cssFilter:cssFilter,
     presetOffsets:presetOffsets,ensureFilter:ensureFilter,chromaKey:chromaKey};
 })();
+
+/* ============================================================
+   关键帧参数采样（F2 修复：预览主线程分支与导出共用同一实现）
+   clip.renderGraph 内 node_transform/node_color 的关键帧按局部时间(ms)
+   经 DAGEngine.sampleParam 插值；无关键帧或引擎缺失时回退静态 props。
+   返回浅拷贝 props（不修改原对象）。
+   ============================================================ */
+function resolveClipParams(clip, localSec){
+  var p = clip.props || {};
+  var g = clip.renderGraph;
+  if(!g || !g.nodes || !g.nodes.length || !window.DAGEngine || !DAGEngine.sampleParam) return p;
+  var tMs = Math.max(0, Math.round(localSec * 1000));
+  var out = null;
+  for(var i = 0; i < g.nodes.length; i++){
+    var n = g.nodes[i];
+    if(n.type !== 'transform' && n.type !== 'color') continue;
+    if(!n.params) continue;
+    var vals = {}, got = false;
+    for(var k in n.params){
+      var v = n.params[k];
+      // 关键帧数组形如 [{time,value,easing},...]；静态值由 sampleParam 原样返回，无需判断
+      if(Array.isArray(v) && v.length && typeof v[0] === 'object' && v[0] && ('time' in v[0])){
+        vals[k] = DAGEngine.sampleParam(v, tMs);
+        got = true;
+      }
+    }
+    if(got){
+      if(!out){ out = {}; for(var k2 in p) out[k2] = p[k2]; }
+      for(var k3 in vals) out[k3] = vals[k3];
+    }
+  }
+  return out || p;
+}
 
 /* ============================================================
    App —— 结构操作的统一分发入口（dispatch 桥接层）
@@ -3010,7 +3112,8 @@ function drawPreviewMain(ctx,w,h){
   var showingVideo=false;
   if(layers.length){
     layers.forEach(function(L){
-      EffectPipe.drawFrame(ctx,L.e,L.clip.props||{},w,h,{clipId:L.clip.id,pxScale:1,ckMaxW:Math.round(Math.max(320,w))});
+      var eff=resolveClipParams(L.clip,State.playhead-L.clip.start); // 关键帧采样（主线程预览分支）
+      EffectPipe.drawFrame(ctx,L.e,eff,w,h,{clipId:L.clip.id,pxScale:1,ckMaxW:Math.round(Math.max(320,w))});
     });
     showingVideo=true;
   }else if(State.previewSource){
@@ -3689,8 +3792,9 @@ function renderProps(){
       mkSlider(sec.body,'音量','%',0,200,1,function(){return c.props.volume;},function(v){setClipProp(c,'volume',v);});
       mkSlider(sec.body,'淡入','s',0,5,0.1,function(){return c.props.fadeIn;},function(v){setClipProp(c,'fadeIn',v);});
       mkSlider(sec.body,'淡出','s',0,5,0.1,function(){return c.props.fadeOut;},function(v){setClipProp(c,'fadeOut',v);});
-      mkSelect(sec.body,'变声',[['none','无'],['loli','萝莉'],['uncle','大叔'],['kid','正太'],['robot','机器人'],['electro','电音']],
+      mkSelect(sec.body,'变声',[['none','无（变声开发中）']],
         function(){return c.props.voice;},function(v){setClipProp(c,'voice',v);});
+      sec.body.appendChild(el('div','sec-hint','音频变声依赖实时 DSP 变调管线，列入 v0.5 音频系统——按「不伪造功能」原则暂只提供「无」。'));
     }else if(key==='keyframe'){
       // DAG 关键帧系统：支持缓动函数选择 + 任意参数关键帧
       var row=el('div','btn-row');
@@ -4577,9 +4681,12 @@ function renderAudioWindow(w0,wlen,clips){
 }
 function drawExportFrame(ctx,t,W,H,watermark){
   ctx.fillStyle='#000';ctx.fillRect(0,0,W,H);
-  videoLayersAt(t).forEach(function(L){ // 视频层：与预览一致的属性效果管线（含色度键 CPU 全分辨率处理）
+  videoLayersAt(t).forEach(function(L){ // 视频层：与预览一致的效果管线 + 关键帧采样（导出时间轴）
     var e=Engine.videoDecoder.getFrame(L.clip.sourceId,L.srcTime);
-    if(e)EffectPipe.drawFrame(ctx,e,L.clip.props||{},W,H,{clipId:L.clip.id,pxScale:W/720,ckMaxW:W});
+    if(e){
+      var eff=resolveClipParams(L.clip,t-L.clip.start);
+      EffectPipe.drawFrame(ctx,e,eff,W,H,{clipId:L.clip.id,pxScale:W/720,ckMaxW:W});
+    }
   });
   // 字幕层：与预览共用同一渲染函数
   drawTextLayers(ctx,t,W,H);
@@ -5959,35 +6066,37 @@ function init(){
   /* —— 底部导航 + 抽屉 + 触摸手势：无条件绑定（CSS 控制可见性）。
      桌面加载→窗口缩窄/分屏时同样可用（isMobile 只影响一次性布局决策） —— */
   {
+    // F3：加载即记录属性面板的家（此时必在右侧面板），供抽屉打开/关闭时移动归位
+    window.__propsBodyHome=els.propsBody.parentElement;
     // 底部抽屉逻辑（互斥打开）
     function closeAllSheets(){
       document.querySelectorAll('.mobile-sheet').forEach(function(s){s.classList.remove('open');});
+      // F3：属性面板归位（真实 DOM，保留全部 listener）
+      if(window.__propsBodyHome&&els.propsBody.parentElement!==window.__propsBodyHome){
+        window.__propsBodyHome.appendChild(els.propsBody);
+      }
     }
     function toggleSheet(id){
       var sheet=document.getElementById(id);
       var isOpen=sheet.classList.contains('open');
       closeAllSheets();
+      if(id==='sheetMedia'){ // 素材抽屉每次打开重建克隆（库内容含动态渲染）
+        var body=document.getElementById('sheetMediaBody');
+        body.innerHTML='';
+        var clone=els.libBody.cloneNode(true);
+        clone.style.display='block';clone.style.padding='0';
+        body.appendChild(clone);
+        bindLibDrag();
+        var imp=clone.querySelector('#importBtn');
+        if(imp)imp.addEventListener('click',function(){els.fileInput.click();});
+      }
       if(!isOpen){
         sheet.classList.add('open');
-        // 素材抽屉：克隆桌面端素材库内容
-        if(id==='sheetMedia'){
-          var body=document.getElementById('sheetMediaBody');
-          body.innerHTML='';
-          var clone=els.libBody.cloneNode(true);
-          clone.style.display='block';clone.style.padding='0';
-          body.appendChild(clone);
-          // 重新绑定事件（克隆后需重绑）
-          bindLibDrag();
-          var imp=clone.querySelector('#importBtn');
-          if(imp)imp.addEventListener('click',function(){els.fileInput.click();});
-        }
-        // 属性抽屉：克隆桌面端属性面板内容
         if(id==='sheetProps'){
+          // F3 修复：移动真实 propsBody 进抽屉（克隆不携带 listener 会导致控件全部失效），关闭时归还
           var pb=document.getElementById('sheetPropsBody');
-          pb.innerHTML='';
-          var clone2=els.propsBody.cloneNode(true);
-          clone2.style.display='block';clone2.style.padding='0';
-          pb.appendChild(clone2);
+          pb.appendChild(els.propsBody);
+          els.propsBody.style.display='block';
         }
       }
     }
@@ -6008,7 +6117,10 @@ function init(){
 
     // 点击抽屉外的区域关闭
     document.addEventListener('pointerdown',function(e){
-      if(!e.target.closest('.mobile-sheet')&&!e.target.closest('#bottomNav')){
+      var tgt=e.target;
+      var inSheet=tgt&&tgt.closest&&tgt.closest('.mobile-sheet');
+      var inNav=tgt&&tgt.closest&&tgt.closest('#bottomNav');
+      if(!inSheet&&!inNav){
         closeAllSheets();
       }
     });
@@ -6181,7 +6293,7 @@ function init(){
     RenderCoordinator:window._renderCoord,DAGEngine:window.DAGEngine,
     muxMp4FromChunks:muxMp4FromChunks,mockGenerateVideo:mockGenerateVideo,makeMockBGM:makeMockBGM,
     ops:{copy:copySelected,paste:pasteClips,duplicate:duplicateSelected,del:deleteSelected,split:splitSelected,selectAll:selectAllClips},
-    EffectPipe:EffectPipe,setClipProp:setClipProp,App:App,
+    EffectPipe:EffectPipe,setClipProp:setClipProp,App:App,resolveClipParams:resolveClipParams,
     opLog:function(){return _dcore?_dcore.opLog.slice():[];},
     version:'0.3.0-studio'};
 }
