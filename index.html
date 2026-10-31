@@ -299,6 +299,15 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
 .batch-info{font-size:11px;color:var(--accent-text);flex:1}
 #penOverlay{position:absolute;inset:0;z-index:5;display:none;cursor:crosshair;touch-action:none}
 #penOverlay.on{display:block}
+.sb-shot{border:1px solid var(--line);border-radius:var(--radius);background:var(--bg3);padding:8px 10px;margin-bottom:6px}
+.sb-head{display:flex;align-items:center;gap:8px}
+.sb-badge{width:18px;height:18px;border-radius:4px;background:var(--accent-deep);color:#fff;font-size:11px;
+  display:flex;align-items:center;justify-content:center;flex:none;font-weight:600}
+.sb-desc{flex:1;font-size:12px;color:var(--text);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sb-dur{font-size:10.5px;color:var(--faint);font-variant-numeric:tabular-nums;flex:none}
+.sb-narr{font-size:11px;color:var(--muted);margin:5px 0 0 26px}
+.sb-vp{font-size:10.5px;color:var(--faint);margin:4px 0 0 26px;line-height:1.5}
+.sb-ok{font-size:11px;color:var(--ok)}
 .env-wrap{margin:8px 0 4px}
 .env-label{font-size:11px;color:var(--muted);margin-bottom:4px}
 .env-wrap canvas{width:100%;height:48px;display:block;background:var(--bg3);border:1px solid var(--line);border-radius:var(--radius);cursor:crosshair;touch-action:none}
@@ -6079,6 +6088,8 @@ function aiHideError(){
    live=已接入真实处理 dev=依赖未就绪（如实标注，不伪装）
    ============================================================ */
 var AI_FUNCS=[
+  {key:'story',cat:'AI 工作流',name:'AI 策划分镜',ic:'film',state:'live',desc:'输入主题 → Qwen 生成结构化分镜 → 逐镜生成视频素材 → 一键铺装时间线'},
+  {key:'autocut',cat:'AI 工作流',name:'AI 智能剪辑',ic:'layers',state:'live',desc:'将素材库的本地上传视频按规则自动组合上轨（含转场）——规则引擎，非内容理解'},
   {key:'t2v',cat:'视频生成',name:'AI 文生视频',ic:'sparkles',state:'live',desc:'输入文字描述，通义万相生成短视频片段'},
   {key:'i2v',cat:'视频生成',name:'AI 图生视频',ic:'camera',state:'live',desc:'上传一张图片作为首帧，AI 让它动起来'},
   {key:'t2i',cat:'图片生成',name:'AI 图片生成',ic:'image',state:'live',desc:'文字生成图片素材，可直接加入时间线'},
@@ -6093,12 +6104,12 @@ var AI_FUNCS=[
 var aiCenterTab='t2v';
 var aiJob={busy:false,cancelled:false,taskId:null,kind:null}; // 当前生成任务
 
-function aiPoll(url,onProgress,onDone,onFail){
-  // 轮询任务状态；返回 cancel 函数
+function aiPoll(taskId,onProgress,onDone,onFail){
+  // 轮询任务状态；返回 cancel 函数（taskId 显式传入，支持分镜多任务并存）
   var stop=false,timer=null;
   function tick2(){
     if(stop)return;
-    fetch(API_BASE+'/api/ai/task/'+aiJob.taskId).then(function(r){return r.json();}).then(function(j){
+    fetch(API_BASE+'/api/ai/task/'+taskId).then(function(r){return r.json();}).then(function(j){
       if(stop)return;
       if(j.error){onFail(j.error);return;}
       onProgress(j);
@@ -6206,7 +6217,8 @@ function renderAIFunc(main){
     })();
   }
   var fn={t2v:aiPanelT2V,i2v:aiPanelI2V,t2i:aiPanelT2I,tts:aiPanelTTS,ck:aiPanelCK,
-    enhance:aiPanelEnhance,style:aiPanelStyle,idea:aiPanelIdea}[f.key];
+    enhance:aiPanelEnhance,style:aiPanelStyle,idea:aiPanelIdea,
+    story:aiPanelStory,autocut:aiPanelAutoCut}[f.key];
   if(fn)fn(main);
 }
 /* —— 公共表单件 —— */
@@ -6242,6 +6254,172 @@ function aiProgress(main){
       b.addEventListener('click',a.fn);act.appendChild(b);
     });}
   };
+}
+/* —— AI 策划分镜：主题 → 结构化分镜 → 逐镜生成 → 铺装时间线 —— */
+var aiStoryboard=null; // {title,shots:[{dur,desc,visualPrompt,narration,item,done,progress}]}
+function aiPanelStory(main){
+  var form=aiForm(main);
+  var ta=document.createElement('textarea');
+  ta.placeholder='输入视频主题，例如：介绍城市周末市集的种草短视频，氛围轻松治愈';
+  form.appendChild(ta);
+  var row=el('div','aic-row');
+  var cnt=document.createElement('select');cnt.className='ctl';
+  [[4,'4 个分镜'],[5,'5 个分镜'],[6,'6 个分镜'],[3,'3 个分镜']].forEach(function(o){
+    var op=document.createElement('option');op.value=o[0];op.textContent=o[1];cnt.appendChild(op);});
+  row.appendChild(el('span','field-label','分镜数'));row.appendChild(cnt);
+  row.appendChild(el('span','spacer'));
+  var go=el('button','btn primary',icon('sparkles',13)+' 生成方案');
+  row.appendChild(go);
+  form.appendChild(row);
+  var st=el('div','ai-status','生成后可逐镜生成视频素材（消耗生成额度，逐镜手动触发），再一键铺装时间线');
+  main.appendChild(st);
+  var err=el('div','ai-err');main.appendChild(err);
+  var listWrap=el('div','aic-form');main.appendChild(listWrap);
+  function renderShots(){
+    listWrap.innerHTML='';
+    if(!aiStoryboard)return;
+    listWrap.appendChild(el('div','field-label','「'+esc(aiStoryboard.title)+'」· '+aiStoryboard.shots.length+' 个分镜'));
+    aiStoryboard.shots.forEach(function(sh,i){
+      var box=el('div','sb-shot');
+      var head=el('div','sb-head');
+      var badge=el('span','sb-badge',String(i+1));
+      head.appendChild(badge);
+      head.appendChild(el('span','sb-desc',esc(sh.desc||('分镜 '+(i+1)))));
+      head.appendChild(el('span','sb-dur',sh.dur+'s'));
+      box.appendChild(head);
+      if(sh.narration)box.appendChild(el('div','sb-narr','旁白：'+esc(sh.narration)));
+      var vp=el('div','sb-vp','生成提示词：'+esc(sh.visualPrompt));
+      box.appendChild(vp);
+      var acts=el('div','aic-row');
+      if(sh.done&&sh.item){
+        acts.appendChild(el('span','sb-ok','✓ 素材已入库：'+esc(sh.item.name)));
+      }else{
+        var bGen=el('button','btn sm',icon('sparkles',12)+(sh.progress?(' 生成中 '+Math.round(sh.progress*100)+'%'):' 生成视频素材'));
+        bGen.disabled=!!sh.progress;
+        bGen.addEventListener('click',function(){
+          bGen.disabled=true;
+          fetch(API_BASE+'/api/ai/video',{method:'POST',headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({prompt:sh.visualPrompt,duration:Math.round(sh.dur)}),signal:AbortSignal.timeout(40000)})
+            .then(function(r){return r.json().then(function(j){return {code:r.status,j:j};});})
+            .then(function(res){
+              if(res.code!==200)throw new Error(res.j.error||'任务创建失败');
+              var stop=aiPoll(res.j.taskId,function(j){sh.progress=j.progress||0.3;renderShots();},
+                function(blob){
+                  sh.progress=null;sh.done=true;
+                  var file=new File([blob],'分镜'+(i+1)+' '+ (sh.desc||'').slice(0,10)+'.mp4',{type:'video/mp4'});
+                  ingestVideoFile(file,file.name).then(function(r2){
+                    if(r2&&r2.item)sh.item=r2.item;
+                    renderShots();toast('分镜 '+(i+1)+' 素材已入库');
+                  });
+                },
+                function(msg){sh.progress=null;renderShots();err.textContent='分镜 '+(i+1)+'：'+msg;err.classList.add('on');});
+              sh._stop=stop;
+            })
+            .catch(function(e){sh.progress=null;renderShots();err.textContent='分镜 '+(i+1)+' 提交失败：'+((e&&e.message)||e);err.classList.add('on');});
+        });
+        acts.appendChild(bGen);
+      }
+      box.appendChild(acts);
+      listWrap.appendChild(box);
+    });
+    var foot=el('div','aic-actions');
+    var bLay=el('button','btn primary',icon('layers',13)+' 铺装时间线（含旁白字幕与转场）');
+    bLay.addEventListener('click',function(){
+      var S=window.__EDITOR__.State;
+      var t=Math.max(0,S.playhead);
+      var placed=0,narrs=0,first=true;
+      beginChange();
+      aiStoryboard.shots.forEach(function(sh){
+        if(sh.item){
+          var beforeN=S.clips.length;
+          addClipFromLib(sh.item,'video',t);
+          // 定位刚加入的视频轨片段（addClipFromLib 可能同时建音频片段）
+          var placed2=null;
+          for(var pi=beforeN;pi<S.clips.length;pi++)
+            if(trackTypeOf(S.clips[pi])==='video')placed2=S.clips[pi];
+          if(!first&&placed2)placed2.transIn={type:'fade',dur:0.4};
+          first=false;
+          placed++;
+          t+=Math.max(0.5,(placed2?placed2.duration:sh.dur));
+        }else{
+          t+=sh.dur; // 未生成的镜头按规划时长留白
+        }
+        if(sh.narration){
+          var tr=null;
+          for(var i2=0;i2<S.tracks.length;i2++)if(S.tracks[i2].type==='text'&&!S.tracks[i2].locked){tr=S.tracks[i2];break;}
+          if(!tr)tr=addTrackOf('text');
+          var nc=makeClip(tr.id,t-sh.dur>0?t-sh.dur:0,sh.dur,('旁白：'+sh.narration).slice(0,14));
+          nc.props.text=sh.narration;nc.props.textStyle='bar';
+          App.clipAdd(nc);
+          S.clips.push(nc);narrs++;
+        }
+      });
+      endChange();renderHeaders();renderProps();requestRender();
+      toast('已铺装：'+placed+' 个视频镜头 · '+narrs+' 条旁白字幕');
+      closeModal();
+    });
+    foot.appendChild(bLay);
+    listWrap.appendChild(foot);
+  }
+  go.addEventListener('click',function(){
+    var brief=ta.value.trim();
+    if(!brief){err.textContent='请先输入视频主题';err.classList.add('on');return;}
+    err.classList.remove('on');
+    go.disabled=true;st.textContent='Qwen 策划分镜中（约 10-20 秒）…';
+    fetch(API_BASE+'/api/ai/storyboard',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({brief:brief,shots:+cnt.value}),signal:AbortSignal.timeout(95000)})
+      .then(function(r){return r.json().then(function(j){return {code:r.status,j:j};});})
+      .then(function(res){
+        if(res.code!==200)throw new Error(res.j.error||'策划失败');
+        aiStoryboard={title:res.j.title,shots:res.j.shots};
+        st.textContent='方案已生成 —— 逐镜生成素材或直接铺装旁白字幕';
+        renderShots();
+      })
+      .catch(function(e){st.textContent='';err.textContent='策划失败：'+((e&&e.message)||e);err.classList.add('on');})
+      .then(function(){go.disabled=false;});
+  });
+}
+/* —— AI 智能剪辑：规则引擎自动组合 —— */
+function aiPanelAutoCut(main){
+  var customs=LIB_RAW.media.filter(function(it){return it.custom&&it.kind==='video'&&it.meta;});
+  var form=aiForm(main);
+  form.appendChild(el('div','field-label','检测到本地上传视频素材：'+customs.length+' 个'+(customs.length?'（'+customs.map(function(x){return x.name;}).join('、')+'）':'')));
+  var row=el('div','aic-row');
+  var maxLen=document.createElement('select');maxLen.className='ctl';
+  [[2,'每镜最长 2s'],[3,'每镜最长 3s'],[4,'每镜最长 4s（默认）'],[5,'每镜最长 5s']].forEach(function(o){
+    var op=document.createElement('option');op.value=o[0];op.textContent=o[1];maxLen.appendChild(op);});
+  row.appendChild(el('span','field-label','节奏'));row.appendChild(maxLen);
+  var transChk=document.createElement('label');transChk.className='checkrow';transChk.style.margin='0';
+  var tchk=document.createElement('input');tchk.type='checkbox';tchk.checked=true;
+  transChk.appendChild(tchk);transChk.appendChild(document.createTextNode(' 镜间叠化转场'));
+  row.appendChild(transChk);
+  form.appendChild(row);
+  var go=el('button','btn primary',icon('layers',13)+' 自动组合上轨');
+  go.style.marginTop='8px';main.appendChild(go);
+  var st=el('div','ai-status','从当前播放头起，按素材顺序排列（每镜截取开头节奏段），镜间叠化。');main.appendChild(st);
+  go.addEventListener('click',function(){
+    if(!customs.length){st.textContent='素材库中没有本地上传视频（先在媒体库导入）';return;}
+    var S=window.__EDITOR__.State;
+    var ml=+maxLen.value,t=Math.max(0,S.playhead),first=true,placed=0;
+    beginChange();
+    customs.forEach(function(it){
+      var beforeN=S.clips.length;
+      addClipFromLib(it,'video',t);
+      var c=null;
+      for(var pi=beforeN;pi<S.clips.length;pi++)
+        if(trackTypeOf(S.clips[pi])==='video')c=S.clips[pi];
+      if(c){
+        if(c.duration>ml)c.duration=ml;
+        if(!first&&tchk.checked)c.transIn={type:'fade',dur:0.4};
+        first=false;
+        t+=c.duration;placed++;
+      }
+    });
+    endChange();renderHeaders();renderProps();requestRender();
+    toast('已自动组合 '+placed+' 个镜头'+(tchk.checked?'（含叠化转场）':''));
+    closeModal();
+  });
+  main.appendChild(el('div','aic-note','这是基于时长与顺序的规则引擎自动组合（真实执行，非内容理解）。AI 内容理解剪辑依赖多模态模型，开发中。'));
 }
 /* —— 文生视频 —— */
 function aiPanelT2V(main){
@@ -6282,7 +6460,7 @@ function aiPanelT2V(main){
         if(res.code!==200)throw new Error(res.j.error||'任务创建失败');
         aiJobStart('t2v',res.j.taskId);
         ui.show(0.1,'已提交，万相生成中（约 1-3 分钟）…');
-        var stop=aiPoll(null,function(j){ui.show(j.progress||0.3,'生成中 '+(j.stage||'')+'…');},
+        var stop=aiPoll(aiJob.taskId,function(j){ui.show(j.progress||0.3,'生成中 '+(j.stage||'')+'…');},
           function(blob){aiJobReset();ui.hide();ui.preview(blob,true);
             ui.actions([
               {label:'加入时间线',primary:true,icon:'plus',fn:function(){ui.actions([]);
@@ -6335,7 +6513,7 @@ function aiPanelI2V(main){
         if(res.code!==200)throw new Error(res.j.error||'任务创建失败');
         aiJobStart('i2v',res.j.taskId);
         ui.show(0.1,'已提交，图生视频生成中…');
-        var stop=aiPoll(null,function(j){ui.show(j.progress||0.3,'生成中…');},
+        var stop=aiPoll(aiJob.taskId,function(j){ui.show(j.progress||0.3,'生成中…');},
           function(blob){aiJobReset();ui.hide();ui.preview(blob,true);
             ui.actions([
               {label:'加入时间线',primary:true,icon:'plus',fn:function(){ui.actions([]);
@@ -6388,7 +6566,7 @@ function aiPanelT2I(main){
         if(res.code!==200)throw new Error(res.j.error||'任务创建失败');
         aiJobStart('t2i',res.j.taskId);
         ui.show(0.2,'已提交，图片生成中…');
-        var stop=aiPoll(null,function(j){ui.show(j.progress||0.5,'生成中…');},
+        var stop=aiPoll(aiJob.taskId,function(j){ui.show(j.progress||0.5,'生成中…');},
           function(blob){aiJobReset();ui.hide();ui.preview(blob,false);
             ui.actions([
               {label:'加入时间线（4 秒）',primary:true,icon:'plus',fn:function(){ui.actions([]);
@@ -7354,7 +7532,7 @@ function init(){
     ops:{copy:copySelected,paste:pasteClips,duplicate:duplicateSelected,del:deleteSelected,split:splitSelected,selectAll:selectAllClips},
     EffectPipe:EffectPipe,setClipProp:setClipProp,App:App,resolveClipParams:resolveClipParams,ImageStore:ImageStore,drawExportFrame:drawExportFrame,renderAudioWindow:renderAudioWindow,
     opLog:function(){return _dcore?_dcore.opLog.slice():[];},
-    version:'0.5.1'};
+    version:'0.6.0'};
 }
 
 init();

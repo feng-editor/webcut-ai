@@ -89,6 +89,7 @@ _RATE_RULES = {  # 端点前缀 → (次数, 窗口秒)
     '/api/ai/image': (6, 600),      # 6 次 / 10 分钟
     '/api/ai/tts': (10, 600),       # 10 次 / 10 分钟
     '/api/ai/prompt': (30, 600),    # 30 次 / 10 分钟
+    '/api/ai/storyboard': (10, 600),  # 10 次 / 10 分钟
 }
 _rate_hits = collections.defaultdict(collections.deque)  # (ip, prefix) → [timestamps]
 _rate_lock = threading.Lock()
@@ -472,10 +473,82 @@ def enhance_prompt():
         if not txt:
             return jsonify({'error': '模型未返回内容'}), 502
         return jsonify({'prompt': txt.strip()})
-
     except Exception as e:
         print(f'!!!! [QWEN] 异常: {e} !!!!', flush=True)
         return jsonify({'error': str(e)}), 500
+
+
+# ============================================================
+# AI 策划分镜（Qwen → 结构化分镜 JSON）
+# ============================================================
+@app.route('/api/ai/storyboard', methods=['POST'])
+def create_storyboard():
+    print('>>> [STORYBOARD] 收到分镜策划请求 <<<', flush=True)
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        brief = (data.get('brief') or '').strip()
+        shot_n = data.get('shots') or 5
+        try:
+            shot_n = max(3, min(8, int(shot_n)))
+        except Exception:
+            shot_n = 5
+        if not brief:
+            return jsonify({'error': 'brief 不能为空'}), 400
+        if not KEY:
+            return jsonify({'error': '未配置 DASHSCOPE_API_KEY'}), 501
+
+        sysmsg = ('你是专业短视频导演与AI视频提示词专家。根据用户主题策划分镜脚本，'
+                  '严格只输出如下 JSON（不要 markdown 代码块、不要解释文字）：'
+                  '{"title":"视频标题","shots":[{"dur":4,"desc":"画面内容一句话",'
+                  '"visualPrompt":"用于AI视频生成的中文提示词，含主体/场景/运镜/光线/氛围，40字以内",'
+                  '"narration":"该镜头旁白台词，20字以内，可为空字符串"}]}。'
+                  f'共 {shot_n} 个分镜，每个 dur 取 3-5。')
+        url = DASHSCOPE_BASE + '/api/v1/services/aigc/text-generation/generation'
+        headers = {'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json'}
+        payload = {
+            'model': QWEN_MODEL,
+            'input': {'messages': [
+                {'role': 'system', 'content': sysmsg},
+                {'role': 'user', 'content': brief[:500]}
+            ]},
+            'parameters': {'result_format': 'message', 'max_tokens': 900, 'temperature': 0.7}
+        }
+        resp = req_lib.post(url, headers=headers, json=payload, timeout=90)
+        if resp.status_code != 200:
+            human = _translate_upstream_error(resp.text)
+            return jsonify({'error': human or f'阿里云返回 {resp.status_code}: {resp.text[:200]}'}), 502
+        txt = (((resp.json().get('output') or {}).get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        # 解析：剥掉可能的 markdown 包裹 / 前后杂质
+        m = None
+        import re as _re
+        mm = _re.search(r'\{[\s\S]*\}', txt)
+        if mm:
+            m = mm.group(0)
+        if not m:
+            return jsonify({'error': '模型未返回 JSON：' + txt[:120]}), 502
+        try:
+            sb = json.loads(m)
+        except Exception:
+            return jsonify({'error': '分镜 JSON 解析失败：' + m[:160]}), 502
+        shots = sb.get('shots') or []
+        shots = [sh for sh in shots if isinstance(sh, dict) and sh.get('visualPrompt')]
+        if not shots:
+            return jsonify({'error': '分镜内容为空'}), 502
+        for i, sh in enumerate(shots):
+            try:
+                sh['dur'] = max(2, min(6, float(sh.get('dur') or 4)))
+            except Exception:
+                sh['dur'] = 4
+            sh['narration'] = (sh.get('narration') or '').strip()
+            sh['desc'] = (sh.get('desc') or '').strip()
+            sh['visualPrompt'] = (sh.get('visualPrompt') or '').strip()
+        print(f'>>> [STORYBOARD] 生成 {len(shots)} 个分镜 <<<', flush=True)
+        return jsonify({'title': (sb.get('title') or 'AI 分镜方案').strip()[:40], 'shots': shots})
+
+    except Exception as e:
+        print(f'!!!! [STORYBOARD] 异常: {e} !!!!', flush=True)
+        return jsonify({'error': str(e)}), 500
+
 
 
 # ============================================================
