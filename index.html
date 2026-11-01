@@ -6065,6 +6065,287 @@ function openShortcutsModal(){
     +'<div class="m-actions"><button class="btn primary" id="skOk">关闭</button></div>');
   $id('skOk').addEventListener('click',closeModal);
 }
+/* ---------- 大文件分片上传（P0-3）：SHA-256 秒传 + 断点续传 + 暂停/重试 ---------- */
+function sha256Hex(file,onProg){
+  // 纯 JS SHA-256（分块读取，避免 2GB 文件整载内存）
+  var K=new Int32Array([-2147483648,2139085035,-2067093701,1894986556,-1567486011,-1182122600,1409280732,-96220368,
+    -63143174,-94665066,-433510694,-840226604,-465013472,-243731632,649524431,-1687086476,1270499393,-1958108965,
+    633325493,-185523403,-571074654,-1478231647,466738583,-1527061506,1687166042,-880409674,-1523574872,-644519664,
+    -1656315303,-1163326272,-903445373,14641560,1144112698,-1194820512,-669234323,-165795406,-291942805,-717970830,
+    -522983968,-1450019625,1822203871,-1487037375,-1337446213,356445935,1489711380,-643661860,1741909198,
+    -1311157427,-1087341644,-1596441822,-1020524839,-724688694,-936531684,-1290235865,-884596531,-996221341,
+    -1470141022,-1444563267,-1164811729,1489016263,1674099794,-1043433696,-1151821247,-1104214821]);
+  function rotr(x,n){return (x>>>n)|(x<<(32-n));}
+  var H=new Int32Array([1779033703,-1150833019,1013904242,-1521486534,1359893119,-1694144372,528734635,1541459225]);
+  var w=new Int32Array(64);
+  var BLOCK=4*1024*1024, buf=new Uint8Array(0), off=0, total=0;
+  function processChunk(u8){ // 处理 64 字节对齐部分
+    var nBlocks=Math.floor(u8.length/64);
+    for(var b=0;b<nBlocks;b++){
+      var o=b*64,i;
+      for(i=0;i<16;i++)w[i]=(u8[o+i*4]<<24)|(u8[o+i*4+1]<<16)|(u8[o+i*4+2]<<8)|u8[o+i*4+3];
+      for(i=16;i<64;i++){
+        var s0=rotr(w[i-15],7)^rotr(w[i-15],18)^(w[i-15]>>>3);
+        var s1=rotr(w[i-2],17)^rotr(w[i-2],19)^(w[i-2]>>>10);
+        w[i]=(w[i-16]+s0+w[i-7]+s1)|0;
+      }
+      var a=H[0],b2=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h2=H[7];
+      for(i=0;i<64;i++){
+        var S1=rotr(e,6)^rotr(e,11)^rotr(e,25);
+        var ch2=(e&f)^(~e&g);
+        var t1=(h2+S1+ch2+K[i]+w[i])|0;
+        var S0=rotr(a,2)^rotr(a,13)^rotr(a,22);
+        var maj=(a&b2)^(a&c)^(b2&c);
+        var t2=(S0+maj)|0;
+        h2=g;g=f;f=e;e=(d+t1)|0;d=c;c=b2;b2=a;a=(t1+t2)|0;
+      }
+      H[0]=(H[0]+a)|0;H[1]=(H[1]+b2)|0;H[2]=(H[2]+c)|0;H[3]=(H[3]+d)|0;
+      H[4]=(H[4]+e)|0;H[5]=(H[5]+f)|0;H[6]=(H[6]+g)|0;H[7]=(H[7]+h2)|0;
+    }
+    return u8.length-nBlocks*64; // 返回未处理的尾部字节数
+  }
+  return new Promise(function(resolve,reject){
+    (function next(){
+      file.slice(off,off+BLOCK).arrayBuffer().then(function(ab){
+        var u8=new Uint8Array(ab);total+=u8.length;off+=u8.length;
+        var tail=u8.length?(function(){var kept=processChunk(u8);
+          var rest=new Uint8Array(u8.length-kept);rest.set(u8.slice(u8.length-kept));return rest;})():new Uint8Array(0);
+        buf=rest;
+        if(onProg)try{onProg(off/file.size);}catch(e){}
+        if(off<file.size)return next();
+        // 收尾 padding
+        var bitLen=total*8;
+        var pad=buf;pad[pad.length]=0x80;
+        while(pad.length%64!==56)pad[pad.length]=0;
+        var lenBytes=new Uint8Array(8);
+        for(var i2=0;i2<8;i2++)lenBytes[7-i2]=(bitLen/Math.pow(2,i2*8))&0xFF;
+        var fin=new Uint8Array(pad.length+8);fin.set(pad);fin.set(lenBytes,pad.length);
+        processChunk(fin);
+        var hex='';
+        for(var i3=0;i3<8;i3++){var x=(H[i3]>>>0).toString(16);hex+=('00000000'+x).slice(-8);}
+        resolve(hex);
+      }).catch(reject);
+    })();
+  });
+}
+function cloudUploadLarge(file){
+  if(!userIsLoggedIn())return toast('大文件云上传需先登录（头像菜单）——本文件仍可正常本地编辑');
+  openModal('上传到云端素材库',
+    '<div style="font-size:12px;margin-bottom:6px">'+esc(file.name)+' · '+(file.size/1048576).toFixed(1)+'MB</div>'
+    +'<div class="exp-progress on"><i id="upBar" style="width:0%"></i></div>'
+    +'<div class="ai-status" id="upStage">计算 SHA-256（秒传校验）…</div>'
+    +'<div class="m-actions" style="justify-content:center">'
+    +'<button class="btn" id="upPause">暂停</button><button class="btn" id="upCancel">取消</button></div>');
+  var paused=false,cancelled=false,abort=null;
+  $id('upPause').addEventListener('click',function(){
+    paused=!paused;
+    $id('upPause').textContent=paused?'继续':'暂停';
+    if(paused&&abort)abort();
+    if(!paused)resume();
+  });
+  $id('upCancel').addEventListener('click',function(){
+    cancelled=true;
+    try{localStorage.removeItem('wc-upresume-'+(file.size+'-'+file.name));}catch(e){}
+    closeModal();
+  });
+  function setStage(t,p){var s3=$id('upStage');if(s3)s3.textContent=t;var b3=$id('upBar');if(b3&&p!=null)b3.style.width=Math.round(p*100)+'%';}
+  function resume(){
+    var shaState={hex:null};
+    // 恢复：优先读取上次未完成会话（断点续传）
+    var saved=null;
+    try{saved=JSON.parse(localStorage.getItem('wc-upresume-'+file.size+'-'+file.name)||'null');}catch(e){}
+    sha256Hex(file,function(p){setStage('计算 SHA-256…',p*0.2);}).then(function(sha){
+      shaState.hex=sha;
+      var startAt=0;
+      function afterInit(init){
+        if(cancelled)return;
+        if(init.instant){
+          setStage('秒传成功 —— 云端素材库已存在相同文件',1);
+          setTimeout(function(){closeModal();toast('秒传完成：文件已在云端素材库');},600);
+          return;
+        }
+        var chunk=init.chunkSize,total=init.total,uid2=init.uploadId;
+        try{localStorage.setItem('wc-upresume-'+file.size+'-'+file.name,JSON.stringify({uploadId:uid2,sha:sha}));}catch(e){}
+        var received=init.received||[];
+        startAt=received.length*chunk;
+        var i=received.length;
+        setStage('上传分片 '+i+'/'+total+(received.length?'（断点续传：已跳过 '+received.length+' 片）':''),0.2+0.6*(i/total));
+        function putNext(){
+          if(cancelled)return;
+          if(paused){setTimeout(putNext,600);return;}
+          if(i>=total){
+            setStage('合并与 SHA 校验…',0.85);
+            return fetch(API_BASE+'/api/upload/finish/'+uid2,{method:'POST',headers:{'X-User-Token':PayClient.token()},signal:AbortSignal.timeout(60000)})
+              .then(function(r2){return r2.json();})
+              .then(function(j2){
+                if(j2.error)throw new Error(j2.error);
+                try{localStorage.removeItem('wc-upresume-'+file.size+'-'+file.name);}catch(e){}
+                setStage('上传完成 —— 已加入你的云端素材库（跨设备可用）',1);
+                setTimeout(function(){closeModal();toast('云上传完成：'+file.name);},900);
+              }).catch(function(e3){setStage('失败：'+((e3&&e3.message)||e3));$id('upPause').textContent='重试';paused=true;});
+          }
+          var part=file.slice(i*chunk,(i+1)*chunk);
+          abort=new AbortController();
+          return fetch(API_BASE+'/api/upload/chunk/'+uid2+'/'+i,{method:'PUT',headers:{'X-User-Token':PayClient.token()},
+            body:part,signal:abort.signal}).then(function(r3){
+            if(!r3.ok)throw new Error('分片 '+i+' 上传失败 HTTP '+r3.status);
+            i++;setStage('上传分片 '+i+'/'+total,0.2+0.6*(i/total));
+            return putNext();
+          }).catch(function(e3){
+            if(paused||cancelled)return;
+            setStage('网络中断：'+((e3&&e3.message)||e3)+' —— 3 秒后自动重试（已传分片保留）');
+            setTimeout(putNext,3000);
+          });
+        }
+        return putNext();
+      }
+      // init：本地有续传会话则先查状态续传，否则新 init
+      if(saved&&saved.uploadId){
+        fetch(API_BASE+'/api/upload/status/'+saved.uploadId,{headers:{'X-User-Token':PayClient.token()},signal:AbortSignal.timeout(10000)})
+          .then(function(r2){return r2.json();})
+          .then(function(st2){
+            if(st2.error){ // 会话过期 → 重新 init（走下方正常 init 分支）
+              afterInit({instant:false,received:[],chunkSize:0,total:0,uploadId:saved.uploadId+':reinit'});
+              return;
+            }
+            afterInit({instant:false,received:st2.received||[],chunkSize:st2.chunkSize,total:st2.total,uploadId:saved.uploadId});
+          }).catch(function(){ afterInit({instant:false,received:[],chunkSize:0,total:0,uploadId:saved.uploadId+':err'}); });
+        return;
+      }
+      sha256Hex(file,function(p){setStage('计算 SHA-256…',p*0.2);}).then(function(sha){
+        fetch(API_BASE+'/api/upload/init',{method:'POST',headers:{'Content-Type':'application/json','X-User-Token':PayClient.token()},
+          body:JSON.stringify({name:file.name,size:file.size,sha256:sha,mime:file.type||'application/octet-stream'}),
+          signal:AbortSignal.timeout(20000)})
+          .then(function(r2){return r2.json();})
+          .then(function(init){afterInit(init);})
+          .catch(function(e2){setStage('初始化失败：'+((e2&&e2.message)||e2));});
+      }).catch(function(e2){setStage('SHA 计算失败：'+((e2&&e2.message)||e2));});
+    }).catch(function(e2){setStage('SHA 计算失败：'+((e2&&e2.message)||e2));});
+  }
+}
+  /* ---------- 充值中心（P0-2）：档位/通道/二维码/轮询/流水 ---------- */
+function openCreditTopUp(){
+  openModal('充值中心 — AI 积分','<div id="ctBody" class="ai-status">加载档位…</div>'
+    +'<div class="m-actions"><button class="btn" id="ctLedger">充值流水</button><button class="btn primary" id="ctClose">关闭</button></div>');
+  $id('ctClose').addEventListener('click',closeModal);
+  $id('ctLedger').addEventListener('click',openLedgerModal);
+  fetch(API_BASE+'/api/credits/packs',{signal:AbortSignal.timeout(6000)}).then(function(r){return r.json();}).then(function(j){
+    var body=$id('ctBody');
+    if(!j.packs){body.textContent='加载失败';return;}
+    var prov=j.providers;
+    var ch=[
+      ['mock','演示通道（免支付走通流程）',prov.mock],
+      ['alipay','支付宝（当面付扫码）',prov.alipay],
+      ['wechat','微信支付（Native 扫码）',prov.wechat]
+    ];
+    body.innerHTML='<div class="co-billing" id="ctPacks">'+j.packs.map(function(p,i){
+      return '<div class="co-bill'+(i===0?' active':'')+'" data-pack="'+p.id+'">'
+        +(p.bonus?'<span class="co-tag">加赠 '+p.bonus+'</span>':'')
+        +'<span>'+p.credits+' 积分</span><b>¥'+p.price+'</b></div>';
+    }).join('')+'</div>'
+    +'<div class="co-methods">'+ch.map(function(c2){
+      return '<div class="co-method'+(c2[2]?'':' co-disabled')+(c2[0]==='mock'?' active':'')+'" data-ch="'+c2[0]+'">'+c2[1]
+        +(c2[2]?'':'<div style="font-size:9px;color:var(--faint)">需配置商户凭证</div>')+'</div>';
+    }).join('')+'</div>'
+    +'<div class="qr-wrap"><img id="ctQr" alt="支付二维码" style="width:175px;height:175px;display:block"></div>'
+    +'<div class="qr-caption" id="ctCaption">选择档位后自动创建订单</div>'
+    +'<div class="co-amount">应付：<b id="ctPrice">¥9.90</b><span id="ctCountdown"></span></div>'
+    +'<div class="m-actions" style="justify-content:center"><button class="btn" id="ctMock" style="display:none">模拟支付成功（演示通道）</button></div>'
+    +'<div class="ai-err" id="ctErr"></div>';
+    if(!userIsLoggedIn()){
+      body.insertAdjacentHTML('beforeend','<div class="m-note">积分充值需要登录账号——未登录时仅可走演示通道（不入账）。</div>');
+    }
+    var curPack='pack100',curProv='mock',order=null,pollT=null,cdT=null;
+    function stopT(){if(pollT){clearInterval(pollT);pollT=null;}if(cdT){clearInterval(cdT);cdT=null;}}
+    function teardown(){stopT();}
+    function onPaidDone(){
+      stopT();
+      refreshUserState().then(function(){
+        updateUserChip();
+        closeModal();
+        toast('充值成功 — 积分已到账 ✓');
+      });
+    }
+    function create(){
+      stopT();order=null;
+      $id('ctCaption').textContent='正在创建订单…';
+      $id('ctQr').src='';$id('ctMock').style.display='none';$id('ctCountdown').textContent='';
+      fetch(API_BASE+'/api/credits/order',{method:'POST',headers:{'Content-Type':'application/json','X-User-Token':PayClient.token()},
+        body:JSON.stringify({packId:curPack,provider:curProv}),signal:AbortSignal.timeout(40000)})
+        .then(function(r){return r.json().then(function(j2){return {code:r.status,j2:j2};});})
+        .then(function(res){
+          if(res.code!==200)throw new Error(res.j2.error||'下单失败');
+          order=res.j2;
+          if(order.qrCode){ // 真实通道：后端返回 code_url —— 前端展示订单二维码
+            $id('ctQr').src='/api/orders/'+order.orderId+'/qr.png';
+            $id('ctCaption').textContent=curProv==='alipay'?'请使用支付宝扫一扫完成支付':'请使用微信扫一扫完成支付';
+          }else{
+            $id('ctQr').src='/api/orders/'+order.orderId+'/qr.png';
+            $id('ctCaption').textContent='演示通道 · 扫码或点击下方按钮走通完整流程';
+            $id('ctMock').style.display='';
+          }
+          cdT=setInterval(function(){
+            if(!els.modalMask.classList.contains('open'))return teardown();
+            var left=Math.max(0,Math.round(order.expireAt-Date.now()/1000));
+            $id('ctCountdown').textContent=left>0?('订单有效期 '+String(Math.floor(left/60)).padStart(2,'0')+':'+String(left%60).padStart(2,'0')):'';
+          },1000);
+          pollT=setInterval(function(){
+            if(!els.modalMask.classList.contains('open'))return teardown();
+            fetch(API_BASE+'/api/orders/'+order.orderId+'/status',{signal:AbortSignal.timeout(8000)})
+              .then(function(r2){return r2.json();})
+              .then(function(s2){ if(s2.status==='paid')onPaidDone(); })
+              .catch(function(){});
+          },2500);
+        })
+        .catch(function(e2){
+          $id('ctCaption').textContent='下单失败';
+          var e3=$id('ctErr');e3.textContent=((e2&&e2.message)||e2);e3.classList.add('on');
+          if(/积分不足/.test(e3.textContent)===false&&/登录/.test(e3.textContent)){
+            e3.insertAdjacentHTML('beforeend','<div><button class="btn sm primary" id="ctLogin">去登录</button></div>');
+            $id('ctLogin').addEventListener('click',function(){teardown();openAuthModal('login');});
+          }
+        });
+    }
+    Array.prototype.forEach.call(body.querySelectorAll('#ctPacks .co-bill'),function(b){
+      b.addEventListener('click',function(){
+        Array.prototype.forEach.call(body.querySelectorAll('#ctPacks .co-bill'),function(x){x.classList.remove('active');});
+        b.classList.add('active');
+        curPack=b.dataset.pack;
+        var pk=j.packs.find(function(p){return p.id===curPack;});
+        $id('ctPrice').textContent='¥'+pk.price;
+        create();
+      });
+    });
+    Array.prototype.forEach.call(body.querySelectorAll('.co-method'),function(m2){
+      m2.addEventListener('click',function(){
+        if(m2.classList.contains('co-disabled'))return toast('该通道需在 .env 配置商户凭证后启用');
+        Array.prototype.forEach.call(body.querySelectorAll('.co-method'),function(x){x.classList.remove('active');});
+        m2.classList.add('active');
+        curProv=m2.dataset.ch;
+        create();
+      });
+    });
+    body.addEventListener('click',function(e2){
+      if(e2.target.id==='ctMock'&&order){
+        fetch(API_BASE+'/api/orders/'+order.orderId+'/mock-pay',{method:'POST',headers:{'X-User-Token':PayClient.token()}})
+          .then(function(r2){return r2.json();})
+          .then(function(j2){ if(j2.error)toast('模拟支付失败：'+j2.error); });
+      }
+    });
+    create();
+  }).catch(function(){ $id('ctBody').textContent='加载失败（后端不可达）'; });
+}
+function openLedgerModal(){
+  fetch(API_BASE+'/api/me/ledger',{headers:{'X-User-Token':PayClient.token()},signal:AbortSignal.timeout(6000)})
+    .then(function(r){return r.json();}).then(function(j){
+      var rows=(j.ledger||[]).map(function(it){
+        return '<div class="sk-row"><span>'+(it.delta>0?'+':'')+it.delta+'</span><span class="sk-desc">'+esc(it.reason)+' · '+new Date(it.createdAt*1000).toLocaleString()+'</span></div>';
+      }).join('');
+      openModal('充值 / 消费流水','<div class="sk-wrap" style="display:block">'+(rows||'<div class="ai-status">暂无流水</div>')+'</div>'
+        +'<div class="m-actions"><button class="btn primary" id="lgOk">关闭</button></div>');
+      $id('lgOk').addEventListener('click',closeModal);
+    }).catch(function(){ toast('流水加载失败'); });
+}
 /* ---------- 项目管理器：列表/打开/重命名/副本/删除/导入/导出 ---------- */
 function openProjectsModal(){
   openModal('项目管理','<div id="pmLoading" class="ai-status">读取项目列表…</div><div class="pm-list" id="pmList"></div>'
@@ -6308,10 +6589,32 @@ function openProfileModal(){
     +'<button class="btn sm" id="pfCloudPush">立即备份到云端</button>'
     +'<button class="btn sm" id="pfCloudPull">从云端恢复</button></div>'
     +(userIsLoggedIn()?'':(isPro?'':'<div class="m-actions" style="justify-content:center"><button class="btn primary" id="pfUp">升级专业版</button></div>'))
+    +(userIsLoggedIn()?'<div class="m-actions" style="justify-content:center"><button class="btn primary" id="pfTopUp">'+icon('diamond',13)+' 充值中心</button><button class="btn" id="pfLedger">流水</button></div>':'')
     +(userIsLoggedIn()?'':(isPro?'':'')+'<div class="m-actions" style="justify-content:center'+(isPro?'':';margin-top:0')+'"><button class="btn primary" id="pfAuth">'+icon('user',13)+' 登录 / 注册账号（云同步 · AI 积分）</button></div>')
-    +(userIsLoggedIn()?'<div class="m-actions" style="justify-content:center"><button class="btn" id="pfLogout">退出登录</button></div>':'')
+    +(userIsLoggedIn()?'<div class="m-actions" style="justify-content:center"><button class="btn" id="pfLogout">退出登录</button><button class="btn danger" id="pfDeactivate">注销账号</button></div>':'')
     +'<div class="m-actions"><button class="btn" id="pfOk">关闭</button></div>');
   $id('pfOk').addEventListener('click',closeModal);
+  if($id('pfTopUp'))$id('pfTopUp').addEventListener('click',function(){closeModal();openCreditTopUp();});
+  if($id('pfLedger'))$id('pfLedger').addEventListener('click',function(){closeModal();openLedgerModal();});
+  if($id('pfDeactivate'))$id('pfDeactivate').addEventListener('click',function(){
+    openModal('注销账号','<div class="m-note" style="color:var(--err)">将永久删除你的账号、云端工程与云端媒体，且不可恢复。本机（IndexedDB）数据不受影响。</div>'
+      +'<div class="aic-field"><label>输入密码确认注销</label><input id="daPass" type="password" class="ctl" style="width:100%;padding:7px 9px"></div>'
+      +'<div class="ai-err" id="daErr"></div>'
+      +'<div class="m-actions"><button class="btn" id="daNo">取消</button><button class="btn danger" id="daYes">永久注销</button></div>');
+    $id('daNo').addEventListener('click',closeModal);
+    $id('daYes').addEventListener('click',function(){
+      fetch(API_BASE+'/api/auth/deactivate',{method:'POST',headers:{'Content-Type':'application/json','X-User-Token':PayClient.token()},
+        body:JSON.stringify({password:$id('daPass').value}),signal:AbortSignal.timeout(15000)})
+        .then(function(r){return r.json().then(function(j2){return {code:r.status,j2:j2};});})
+        .then(function(res){
+          if(res.code!==200)throw new Error(res.j2.error||'注销失败');
+          localStorage.setItem('webcut_token','t-'+Date.now()+'-'+Math.random().toString(36).slice(2,10));
+          closeModal();toast('账号已注销，云端数据已删除');
+          setTimeout(function(){location.reload();},800);
+        })
+        .catch(function(e2){$id('daErr').textContent=((e2&&e2.message)||e2);$id('daErr').classList.add('on');});
+    });
+  });
   if($id('pfAuth'))$id('pfAuth').addEventListener('click',function(){closeModal();openAuthModal('login');});
   if($id('pfLogout'))$id('pfLogout').addEventListener('click',function(){
     fetch(API_BASE+'/api/auth/logout',{method:'POST',headers:{'X-User-Token':PayClient.token()}}).catch(function(){});
@@ -6969,7 +7272,9 @@ function aiPanelT2V(main){
               {label:'重新生成',fn:start}
             ]);},
           function(msg){aiJobReset();ui.fail(msg);
-            ui.actions([{label:'重试',primary:true,fn:start}]);});
+            var acts=[{label:'重试',primary:true,fn:start}];
+            if(/积分不足/.test(msg))acts.push({label:'去充值',fn:function(){openCreditTopUp();}});
+            ui.actions(acts);});
         ui.actions([{label:'取消任务',fn:function(){stop();aiJobCancel().then(function(){aiJobReset();ui.hide();ui.st.textContent='任务已取消';ui.actions([{label:'重新生成',fn:start}]);});}}]);
       })
       .catch(function(e){ui.hide();ui.fail('提交失败：'+((e&&e.message)||e));});
@@ -7021,7 +7326,10 @@ function aiPanelI2V(main){
                 aiResultToTimeline(blob,'AI图生视频.mp4','video').then(function(){toast('已加入时间线');closeModal();});}},
               {label:'重新生成',fn:start}
             ]);},
-          function(msg){aiJobReset();ui.fail(msg);ui.actions([{label:'重试',primary:true,fn:start}]);});
+          function(msg){aiJobReset();ui.fail(msg);
+            var acts=[{label:'重试',primary:true,fn:start}];
+            if(/积分不足/.test(msg))acts.push({label:'去充值',fn:function(){openCreditTopUp();}});
+            ui.actions(acts);});
         ui.actions([{label:'取消任务',fn:function(){stop();aiJobCancel().then(function(){aiJobReset();ui.hide();ui.st.textContent='任务已取消';ui.actions([{label:'重新生成',fn:start}]);});}}]);
       })
       .catch(function(e){ui.hide();ui.fail('提交失败：'+((e&&e.message)||e)+'（图生视频需要有效 DashScope Key）');});
@@ -7448,7 +7756,8 @@ function handleFiles(files){
   Array.prototype.forEach.call(files,function(f){
     var kind=f.type.indexOf('video')===0?'video':f.type.indexOf('audio')===0?'music':f.type.indexOf('image')===0?'image':null;
     if(!kind)return toast('暂不支持的文件类型：'+f.name);
-    if(kind==='video'){hasVideo=true;ingestVideoFile(f,f.name);}
+    if(kind==='video'){hasVideo=true;ingestVideoFile(f,f.name);
+      if(f.size>16*1024*1024&&userIsLoggedIn())setTimeout(function(){cloudUploadLarge(f);},800);}
     else if(kind==='image'){ingestImageFile(f,f.name);n++;}
     else{
       var it={name:f.name,kind:kind,dur:'--:--',custom:true};

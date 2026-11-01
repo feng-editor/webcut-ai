@@ -713,6 +713,79 @@ PRICES = {
     'yearly': {'amount': '128.00', 'days': 366, 'subject': 'WebCut 专业版年度会员'},
 }
 
+# ============ AI 积分充值档位（商业化 v1.5） ============
+CREDIT_PACKS = {
+    'pack100': {'price': '9.90', 'credits': 100, 'subject': 'AI 积分 100'},
+    'pack350': {'price': '29.90', 'credits': 350, 'bonus': 50, 'subject': 'AI 积分 300+加赠50'},
+    'pack1300': {'price': '99.90', 'credits': 1300, 'bonus': 250, 'subject': 'AI 积分 1050+加赠250'},
+}
+
+# ============ 真实支付网关配置（未配置的通道如实返回未启用） ============
+PAYCFG = {
+    'alipay': {
+        'appid': cfg('ALIPAY_APPID'),
+        'private_key': cfg('ALIPAY_PRIVATE_KEY').replace('\\n', '\n'),
+        'public_key': cfg('ALIPAY_PUBLIC_KEY').replace('\\n', '\n'),
+        'gateway': cfg('ALIPAY_GATEWAY', 'https://openapi-sandbox.dalipay.com'),
+        'notify_url': cfg('ALIPAY_NOTIFY_URL'),
+    },
+    'wechat': {
+        'appid': cfg('WX_APPID'),
+        'mchid': cfg('WX_MCHID'),
+        'serial': cfg('WX_SERIAL_NO'),
+        'apiv3_key': cfg('WX_APIV3_KEY'),
+        'private_key': cfg('WX_PRIVATE_KEY').replace('\\n', '\n'),
+        'platform_pubkey': cfg('WX_PLATFORM_PUBKEY').replace('\\n', '\n'),
+        'notify_url': cfg('WX_NOTIFY_URL'),
+    },
+}
+def _pay_ready(ch):
+    c = PAYCFG[ch]
+    if ch == 'alipay':
+        return bool(c['appid'] and c['private_key'] and c['gateway'])
+    if ch == 'wechat':
+        return bool(c['appid'] and c['mchid'] and c['apiv3_key'] and c['private_key'])
+    return False
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding as apadding
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+def _load_private(pem):
+    if 'BEGIN' not in pem:
+        pem = '-----BEGIN PRIVATE KEY-----\n' + pem + '\n-----END PRIVATE KEY-----'
+    return serialization.load_pem_private_key(pem.encode(), password=None)
+
+def _load_public(pem):
+    if 'BEGIN' not in pem:
+        pem = '-----BEGIN PUBLIC KEY-----\n' + pem + '\n-----END PUBLIC KEY-----'
+    return serialization.load_pem_public_key(pem.encode())
+
+def _alipay_sign(params):
+    # 支付宝 RSA2：参数按 key 排序 k=v& 串 → SHA256withRSA
+    items = sorted((k, v) for k, v in params.items() if k != 'sign' and v is not None and v != '')
+    data = '&'.join(k + '=' + str(v) for k, v in items)
+    sk = _load_private(PAYCFG['alipay']['private_key'])
+    sig = sk.sign(data.encode('utf-8'), apadding.PKCS1v15(), hashes.SHA256())
+    import base64
+    return base64.b64encode(sig).decode(), data
+
+def _alipay_verify(params):
+    # 支付宝回调验签：同规则串 → 公钥验签；未配置公钥一律拒绝
+    sign = params.pop('sign', '')
+    params.pop('sign_type', None)
+    items = sorted((k, v) for k, v in params.items() if v is not None and v != '')
+    data = '&'.join(k + '=' + str(v) for k, v in items)
+    if not PAYCFG['alipay']['public_key']:
+        return False
+    try:
+        pub = _load_public(PAYCFG['alipay']['public_key'])
+        import base64
+        pub.verify(base64.b64decode(sign), data.encode('utf-8'), apadding.PKCS1v15(), hashes.SHA256())
+        return True
+    except Exception:
+        return False
+
 def _db_load():
     try:
         with open(PAY_FILE, encoding='utf-8') as f:
@@ -766,23 +839,46 @@ def order_status(order_id):
     return jsonify({'orderId': o['id'], 'status': o['status'], 'amount': o['amount']})
 
 
-@app.route('/api/orders/<order_id>/mock-pay', methods=['POST'])
-def mock_pay(order_id):
+# ============ 幂等入账：仅当状态从未 paid → completed 才执行一次 ============
+def _user_by_token(token):
+    # 回调场景无请求上下文：从订单 token 恢复用户（session 优先，匿名 None）
+    if not token:
+        return None
+    con = _db()
+    row = con.execute('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?',
+                      (token,)).fetchone()
+    con.close()
+    if not row:
+        return None
+    return {'id': row[0], 'email': row[1], 'plan': row[4], 'plan_expires': row[5], 'ai_credits': row[6]}
+
+
+def _fulfill_order(order_id, paid_ref):
     with _db_lock:
         db = _db_load()
         o = db['orders'].get(order_id)
-        if not o:
-            return jsonify({'error': '订单不存在'}), 404
-        if o['provider'] != 'demo':
-            return jsonify({'error': '真实支付订单不可模拟'}), 400
-        if o['status'] == 'pending' and time.time() <= o['expireAt']:
-            o['status'] = 'paid'
-            o['paidAt'] = time.time()
-            token = o.get('token', '')
-            if token:
-                days = PRICES[o['cycle']]['days']
-                u = _auth_user()
-                if u:  # 登录用户 → SQLite 套餐
+        if not o or o['status'] == 'paid':
+            return {'dup': True}  # 幂等：重复回调/重复查询不二次入账
+        o['status'] = 'paid'
+        o['paidAt'] = time.time()
+        o['paidRef'] = paid_ref
+        token = o.get('token', '')
+        u = _user_by_token(token)
+        if o.get('type') == 'credits' and o.get('credits'):
+            if u:
+                con = _db()
+                con.execute('UPDATE users SET ai_credits=ai_credits+? WHERE id=?', (int(o['credits']), u['id']))
+                con.execute('INSERT INTO credit_ledger(user_id,delta,reason,ref,created_at) VALUES(?,?,?,?,?)',
+                            (u['id'], int(o['credits']), '充值', order_id, time.time()))
+                con.commit(); con.close()
+            else:
+                o['status'] = 'pending'  # 积分充值必须登录：匿名单不入账（前端强制登录下单）
+                _db_save(db)
+                return {'error': 'credits require login'}
+        else:
+            days = PRICES.get(o.get('cycle'), {}).get('days')
+            if days and token:
+                if u:
                     con = _db()
                     base = max(time.time(), u['plan_expires'])
                     con.execute('UPDATE users SET plan=?, plan_expires=? WHERE id=?',
@@ -792,10 +888,211 @@ def mock_pay(order_id):
                     ent = db['entitlements'].get(token) or {}
                     base = max(time.time(), ent.get('expiresAt', 0))
                     db['entitlements'][token] = {'plan': 'pro', 'expiresAt': base + days * 86400}
-            _db_save(db)
+        _db_save(db)
+        print(f'[pay] 订单入账: {order_id} ref={paid_ref}', flush=True)
+        return {'fulfilled': True}
+
+
+@app.route('/api/credits/packs', methods=['GET'])
+def credit_packs():
+    return jsonify({
+        'packs': [{'id': k, 'price': v['price'], 'credits': v['credits'],
+                   'bonus': v.get('bonus', 0), 'subject': v['subject']} for k, v in CREDIT_PACKS.items()],
+        'providers': {
+            'mock': True,
+            'alipay': _pay_ready('alipay'),
+            'wechat': _pay_ready('wechat'),
+        }})
+
+
+@app.route('/api/me/ledger', methods=['GET'])
+def credit_ledger_api():
+    u = _auth_user()
+    if not u:
+        return jsonify({'error': '未登录'}), 401
+    con = _db()
+    rows = con.execute('SELECT delta,reason,ref,created_at FROM credit_ledger WHERE user_id=? ORDER BY created_at DESC LIMIT 100',
+                       (u['id'],)).fetchall()
+    con.close()
+    return jsonify({'ledger': [{'delta': r2[0], 'reason': r2[1], 'ref': r2[2], 'createdAt': r2[3]} for r2 in rows],
+                    'aiCredits': u['ai_credits']})
+
+
+def _create_credit_order(pack_id, provider, token):
+    pack = CREDIT_PACKS.get(pack_id)
+    if not pack:
+        return None, ('档位不存在', 400)
+    if provider not in ('mock', 'alipay', 'wechat'):
+        return None, ('支付通道无效', 400)
+    if provider != 'mock' and not _pay_ready(provider):
+        return None, ((('支付宝' if provider == 'alipay' else '微信') + '支付未配置商户凭证——请在 .env 填入后重启'), 501)
+    order_id = 'wc' + uuid.uuid4().hex[:20]
+    order = {'id': order_id, 'type': 'credits', 'packId': pack_id, 'credits': pack['credits'],
+             'amount': pack['price'], 'status': 'pending', 'provider': provider, 'token': token,
+             'createdAt': time.time(), 'expireAt': time.time() + 900}
+    with _db_lock:
+        db = _db_load()
+        db['orders'][order_id] = order
+        _db_save(db)
+    return order, None
+
+
+def _create_alipay_qr(order):
+    c = PAYCFG['alipay']
+    params = {
+        'app_id': c['appid'], 'method': 'alipay.trade.precreate',
+        'format': 'JSON', 'charset': 'utf-8', 'sign_type': 'RSA2',
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'version': '1.0', 'notify_url': c['notify_url'],
+        'biz_content': json.dumps({'out_trade_no': order['id'],
+                                   'total_amount': order['amount'],
+                                   'subject': order.get('subject') or CREDIT_PACKS.get(order.get('packId'), {}).get('subject') or PRICES.get(order.get('cycle'), {}).get('subject') or 'WebCut 订单'},
+                                  ensure_ascii=False),
+    }
+    sign, _ = _alipay_sign(params)
+    params['sign'] = sign
+    r = req_lib.post(c['gateway'] + '/gateway.do', data=params, timeout=30)
+    j = r.json()
+    resp = (j.get('alipay_trade_precreate_response') or {})
+    if resp.get('code') != '10000':
+        return None, (resp.get('sub_msg') or j.get('error_response', {}).get('sub_msg') or '支付宝下单失败')
+    return resp.get('qr_code'), None
+
+
+def _create_wechat_qr(order):
+    import base64
+    c = PAYCFG['wechat']
+    path = '/v3/pay/transactions/native'
+    body = json.dumps({'appid': c['appid'], 'mchid': c['mchid'], 'description': order['id'],
+                       'out_trade_no': order['id'],
+                       'notify_url': c['notify_url'],
+                       'amount': {'total': int(round(float(order['amount']) * 100)), 'currency': 'CNY'}},
+                      ensure_ascii=False)
+    ts = str(int(time.time()))
+    nonce = uuid.uuid4().hex
+    msg = 'POST\n' + path + '\n' + ts + '\n' + nonce + '\n' + body + '\n'
+    sk = _load_private(c['private_key'])
+    sig = sk.sign(msg.encode('utf-8'), apadding.PKCS1v15(), hashes.SHA256())
+    auth = ('WECHATPAY2-SHA256withRSA mchid="' + c['mchid'] + '",nonce_str="' + nonce +
+            '",signature="' + base64.b64encode(sig).decode() + '",timestamp="' + ts +
+            '",serial_no="' + c['serial'] + '"')
+    r = req_lib.post('https://api.mch.weixin.qq.com' + path, data=body.encode('utf-8'),
+                     headers={'Authorization': auth, 'Content-Type': 'application/json',
+                              'Accept': 'application/json', 'User-Agent': 'webcut'}, timeout=30)
+    j = r.json()
+    if j.get('code_url'):
+        return j['code_url'], None
+    return None, (j.get('message') or '微信下单失败')
+
+
+@app.route('/api/credits/order', methods=['POST'])
+def create_credit_order():
+    data = request.get_json(force=True, silent=True) or {}
+    token = request.headers.get('X-User-Token', '')
+    order, err = _create_credit_order((data.get('packId') or ''), (data.get('provider') or 'mock'), token)
+    if err:
+        return jsonify({'error': err[0]}), err[1]
+    payload = {'orderId': order['id'], 'amount': order['amount'], 'provider': order['provider'],
+               'credits': order['credits'], 'expireAt': order['expireAt'], 'demo': order['provider'] == 'mock'}
+    qr = None
+    if order['provider'] == 'alipay':
+        qr, err2 = _create_alipay_qr(order)
+        if err2:
+            return jsonify({'error': err2}), 502
+        payload['qrCode'] = qr
+    elif order['provider'] == 'wechat':
+        qr, err2 = _create_wechat_qr(order)
+        if err2:
+            return jsonify({'error': err2}), 502
+        payload['qrCode'] = qr
+    return jsonify(payload)
+
+
+@app.route('/api/orders/<order_id>/qr.png', methods=['GET'])
+def order_qr_png(order_id):
+    # 二维码渲染：优先订单内的真实 code_url；演示通道用订单 ID 生成（扫码提示为演示）
+    with _db_lock:
+        db = _db_load()
+    o = db['orders'].get(order_id)
+    import qrcode
+    qr = qrcode.QRCode(box_size=6, border=2)
+    qr.add_data(o.get('qrCode') or ('webcut://demo/' + order_id))
+    qr.make(fit=True)
+    img = qr.make_image()
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+    return send_file(buf, mimetype='image/png')
+
+
+@app.route('/api/pay/alipay/notify', methods=['POST'])
+def alipay_notify():
+    params = {k: v for k, v in request.form.items()}
+    if not PAYCFG['alipay']['public_key']:
+        return 'fail', 503  # 未配置公钥：拒绝处理（安全优先）
+    if not _alipay_verify(dict(params)):
+        print('[pay] 支付宝回调验签失败', flush=True)
+        return 'fail', 400
+    if params.get('trade_status') not in ('TRADE_SUCCESS', 'TRADE_FINISHED'):
+        return 'success'
+    r2 = _fulfill_order(params.get('out_trade_no', ''), 'alipay:' + params.get('trade_no', ''))
+    return 'success'
+
+
+@app.route('/api/pay/wechat/notify', methods=['POST'])
+def wechat_notify():
+    c = PAYCFG['wechat']
+    if not c['platform_pubkey'] or not c['apiv3_key']:
+        return jsonify({'code': 'FAIL', 'message': '未配置平台公钥/APIv3密钥'}), 503
+    # 验签：Wechatpay-Signature 对 timestamp\nnonce\nbody 验签
+    ts = request.headers.get('Wechatpay-Timestamp', '')
+    nonce = request.headers.get('Wechatpay-Nonce', '')
+    sig = request.headers.get('Wechatpay-Signature', '')
+    body = request.get_data()
+    try:
+        pub = _load_public(c['platform_pubkey'])
+        pub.verify(__import__('base64').b64decode(sig),
+                   (ts + '\n' + nonce + '\n' + body.decode('utf-8', 'replace') + '\n').encode('utf-8'),
+                   apadding.PKCS1v15(), hashes.SHA256())
+    except Exception:
+        print('[pay] 微信回调验签失败', flush=True)
+        return jsonify({'code': 'FAIL', 'message': '验签失败'}), 400
+    try:
+        res = json.loads(body)
+        res2 = res.get('resource', {})
+        dec = AESGCM(c['apiv3_key'].encode('utf-8')).decrypt(
+            res2.get('nonce', '').encode('utf-8'),
+            __import__('base64').b64decode(res2.get('ciphertext', '')),
+            (res2.get('associated_data') or '').encode('utf-8'))
+        ev = json.loads(dec)
+    except Exception as e:
+        return jsonify({'code': 'FAIL', 'message': '解密失败'}), 400
+    if ev.get('trade_state') == 'SUCCESS':
+        _fulfill_order(ev.get('out_trade_no', ''), 'wechat:' + ev.get('transaction_id', ''))
+    return jsonify({'code': 'SUCCESS'})
+
+
+@app.route('/api/orders/<order_id>/mock-pay', methods=['POST'])
+def mock_pay(order_id):
+    # 锁内只读校验 → 锁外 fulfill（_fulfill_order 自带锁，持锁调用非重入会死锁）
+    with _db_lock:
+        db = _db_load()
+        o = db['orders'].get(order_id)
+        if not o:
+            return jsonify({'error': '订单不存在'}), 404
+        prov_ok = o['provider'] in ('demo', 'mock')
+        pend = o['status'] == 'pending' and time.time() <= o['expireAt']
+    if not prov_ok:
+        return jsonify({'error': '真实支付订单不可模拟'}), 400
+    if not pend:
+        return jsonify({'orderId': o['id'], 'status': o['status']})
+    r2 = _fulfill_order(order_id, 'mock')
+    if r2.get('error'):
+        return jsonify({'error': r2['error']}), 402
+    with _db_lock:
+        db = _db_load()
+    o = db['orders'].get(order_id)
     return jsonify({'orderId': o['id'], 'status': o['status']})
-
-
 @app.route('/api/me/entitlements', methods=['GET'])
 def get_entitlements():
     token = request.headers.get('X-User-Token', '')
@@ -843,6 +1140,11 @@ def _db_init():
     CREATE TABLE IF NOT EXISTS sessions(
       token TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
       created_at REAL, last_seen REAL
+    );
+    CREATE TABLE IF NOT EXISTS credit_ledger(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL, delta INTEGER NOT NULL,
+      reason TEXT NOT NULL, ref TEXT, created_at REAL
     );
     CREATE TABLE IF NOT EXISTS cloud_projects(
       user_id INTEGER NOT NULL, project_key TEXT NOT NULL DEFAULT 'main',
@@ -960,6 +1262,212 @@ def auth_me():
         return jsonify({'error': '未登录'}), 401
     return jsonify({'user': {'email': u['email'], 'plan': _user_plan(u),
                              'aiCredits': u['ai_credits'], 'limits': _user_limits(u)}})
+
+# ============ 数据可靠：每日自动备份（保留 7 份）+ 用户注销 ============
+BACKUP_DIR = os.path.join(DATA_DIR, 'backups')
+_last_backup = {'t': 0}
+
+def _run_backup():
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        con = _db()
+        con.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        con.close()
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        dst = os.path.join(BACKUP_DIR, 'webcut-' + stamp + '.db')
+        import shutil
+        shutil.copy2(DB_PATH, dst)
+        files = sorted(f for f in os.listdir(BACKUP_DIR) if f.endswith('.db'))
+        for old_f in files[:-7]:
+            try: os.remove(os.path.join(BACKUP_DIR, old_f))
+            except Exception: pass
+        _last_backup['t'] = time.time()
+        print('[backup] 备份完成:', dst, flush=True)
+    except Exception as e:
+        print('[backup] 失败:', e, flush=True)
+
+def _backup_loop():
+    while True:
+        _run_backup()
+        time.sleep(24 * 3600)
+
+threading.Thread(target=_backup_loop, daemon=True).start()
+
+ADMIN_TOKEN = cfg('ADMIN_TOKEN')
+
+# ============ 大文件分片上传（断点续传 + SHA-256 秒传） ============
+UPLOAD_DIR = os.path.join(DATA_DIR, 'uploads')
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+_sha_index = {}  # sha256 → {'mediaKey': cloud media 相对键}
+try:
+    _sha_fp = os.path.join(UPLOAD_DIR, 'sha-index.json')
+    if os.path.isfile(_sha_fp):
+        with open(_sha_fp, encoding='utf-8') as f:
+            _sha_index = json.load(f)
+except Exception:
+    _sha_index = {}
+_sha_lock = threading.Lock()
+
+def _sha_save():
+    with open(os.path.join(UPLOAD_DIR, 'sha-index.json'), 'w', encoding='utf-8') as f:
+        json.dump(_sha_index, f)
+
+@app.route('/api/upload/init', methods=['POST'])
+def upload_init():
+    u = _auth_user()
+    if not u:
+        return jsonify({'error': '未登录——大文件上传到云端素材库需先登录'}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    name = os.path.basename(data.get('name') or 'file.bin')
+    size = int(data.get('size') or 0)
+    sha = (data.get('sha256') or '').lower()
+    mime = data.get('mime') or 'application/octet-stream'
+    if size <= 0 or size > 2 * 1024 * 1024 * 1024:
+        return jsonify({'error': '文件大小超限（0 < size ≤ 2GB）'}), 400
+    if not (sha and len(sha) == 64 and all(c2 in '0123456789abcdef' for c2 in sha)):
+        return jsonify({'error': '需要 SHA-256（用于秒传与完整性校验）'}), 400
+    # 秒传：同 sha 已上传 → 直接绑定云端媒体
+    with _sha_lock:
+        hit = _sha_index.get(sha)
+    if hit:
+        return jsonify({'instant': True, 'mediaKey': hit['mediaKey'], 'name': name})
+    upload_id = uuid.uuid4().hex
+    chunk = 4 * 1024 * 1024
+    total = (size + chunk - 1) // chunk
+    updir = os.path.join(UPLOAD_DIR, upload_id)
+    os.makedirs(updir, exist_ok=True)
+    meta = {'name': name, 'size': size, 'sha256': sha, 'mime': mime,
+            'user': u['id'], 'chunk': chunk, 'total': total, 'received': []}
+    with open(os.path.join(updir, 'meta.json'), 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False)
+    return jsonify({'uploadId': upload_id, 'chunkSize': chunk, 'total': total})
+
+
+@app.route('/api/upload/status/<upload_id>', methods=['GET'])
+def upload_status(upload_id):
+    u = _auth_user()
+    if not u:
+        return jsonify({'error': '未登录'}), 401
+    updir = os.path.join(UPLOAD_DIR, upload_id)
+    mf = os.path.join(updir, 'meta.json')
+    if not os.path.isfile(mf):
+        return jsonify({'error': '会话不存在（可能已过期，请重新上传）'}), 404
+    meta = json.load(open(mf, encoding='utf-8'))
+    if meta.get('user') != u['id']:
+        return jsonify({'error': '无权访问该上传'}), 403
+    got = sorted(int(f.split('.')[1]) for f in os.listdir(updir) if f.startswith('chunk.'))
+    return jsonify({'received': got, 'chunkSize': meta['chunk'], 'total': meta['total']})
+
+
+@app.route('/api/upload/chunk/<upload_id>/<int:idx>', methods=['PUT'])
+def upload_chunk(upload_id, idx):
+    u = _auth_user()
+    if not u:
+        return jsonify({'error': '未登录'}), 401
+    updir = os.path.join(UPLOAD_DIR, upload_id)
+    mf = os.path.join(updir, 'meta.json')
+    if not os.path.isfile(mf):
+        return jsonify({'error': '会话不存在'}), 404
+    meta = json.load(open(mf, encoding='utf-8'))
+    if meta.get('user') != u['id']:
+        return jsonify({'error': '无权访问'}), 403
+    data = request.get_data()
+    if not data or len(data) > meta['chunk']:
+        return jsonify({'error': '分片数据无效'}), 400
+    with open(os.path.join(updir, 'chunk.' + str(idx)), 'wb') as f:
+        f.write(data)
+    return jsonify({'ok': True, 'idx': idx})
+
+
+@app.route('/api/upload/finish/<upload_id>', methods=['POST'])
+def upload_finish(upload_id):
+    u = _auth_user()
+    if not u:
+        return jsonify({'error': '未登录'}), 401
+    updir = os.path.join(UPLOAD_DIR, upload_id)
+    mf = os.path.join(updir, 'meta.json')
+    if not os.path.isfile(mf):
+        return jsonify({'error': '会话不存在'}), 404
+    meta = json.load(open(mf, encoding='utf-8'))
+    if meta.get('user') != u['id']:
+        return jsonify({'error': '无权访问'}), 403
+    chunks = sorted(int(f.split('.')[1]) for f in os.listdir(updir) if f.startswith('chunk.'))
+    if len(chunks) != meta['total']:
+        return jsonify({'error': '分片不完整', 'received': chunks}), 400
+    import hashlib as _hl
+    h = _hl.sha256()
+    final = os.path.join(updir, 'final.bin')
+    with open(final, 'wb') as out:
+        for idx in chunks:
+            fp = os.path.join(updir, 'chunk.' + str(idx))
+            with open(fp, 'rb') as f2:
+                data = f2.read()
+            h.update(data)
+            out.write(data)
+    sha = h.hexdigest()
+    if sha != meta['sha256']:
+        return jsonify({'error': 'SHA-256 校验失败（上传数据损坏，请重试）'}), 400
+    # 注册进用户云媒体池（uid 目录）
+    mroot = os.path.join(CLOUD_DIR, 'u' + str(u['id']), 'media')
+    os.makedirs(mroot, exist_ok=True)
+    media_key = sha[:16] + '-' + meta['name'].replace('/', '_')
+    import shutil
+    shutil.copy2(final, os.path.join(mroot, media_key))
+    with _sha_lock:
+        _sha_index[sha] = {'mediaKey': media_key}
+        _sha_save()
+    import shutil as _sh
+    try: _sh.rmtree(updir)
+    except Exception: pass
+    print(f'[upload] 完成: {meta["name"]} ({meta["size"]//1024}KB sha={sha[:12]})', flush=True)
+    return jsonify({'ok': True, 'mediaKey': media_key, 'name': meta['name'],
+                    'mime': meta['mime'], 'size': meta['size']})
+
+
+@app.route('/api/admin/backups', methods=['GET'])
+def admin_backups():
+    if not ADMIN_TOKEN or request.headers.get('X-Admin-Token', '') != ADMIN_TOKEN:
+        return jsonify({'error': '未授权'}), 401
+    files = sorted((f for f in os.listdir(BACKUP_DIR) if f.endswith('.db')), reverse=True)
+    return jsonify({'backups': [{'file': f, 'size': os.path.getsize(os.path.join(BACKUP_DIR, f))} for f in files]})
+
+@app.route('/api/admin/backup/<fname>', methods=['GET'])
+def admin_backup_download(fname):
+    if not ADMIN_TOKEN or request.headers.get('X-Admin-Token', '') != ADMIN_TOKEN:
+        return jsonify({'error': '未授权'}), 401
+    if '/' in fname or '\\' in fname or not fname.endswith('.db'):
+        return jsonify({'error': '非法文件名'}), 400
+    fp = os.path.join(BACKUP_DIR, fname)
+    if not os.path.isfile(fp):
+        return jsonify({'error': '不存在'}), 404
+    return send_file(fp, mimetype='application/octet-stream', as_attachment=True)
+
+
+@app.route('/api/auth/deactivate', methods=['POST'])
+def auth_deactivate():
+    data = request.get_json(force=True, silent=True) or {}
+    pw = data.get('password') or ''
+    u = _auth_user()
+    if not u:
+        return jsonify({'error': '未登录'}), 401
+    con = _db()
+    row = con.execute('SELECT pw_salt,pw_hash FROM users WHERE id=?', (u['id'],)).fetchone()
+    if not row or _pw_hash(pw, row[0]) != row[1]:
+        con.close()
+        return jsonify({'error': '密码错误'}), 401
+    con.execute('DELETE FROM sessions WHERE user_id=?', (u['id'],))
+    con.execute('DELETE FROM cloud_projects WHERE user_id=?', (u['id'],))
+    con.execute('DELETE FROM credit_ledger WHERE user_id=?', (u['id'],))
+    con.execute('DELETE FROM users WHERE id=?', (u['id'],))
+    con.commit(); con.close()
+    import shutil
+    media_dir = os.path.join(CLOUD_DIR, 'u' + str(u['id']))
+    try:
+        if os.path.isdir(media_dir): shutil.rmtree(media_dir)
+    except Exception: pass
+    print(f'[auth] 注销并删除数据: uid={u["id"]}', flush=True)
+    return jsonify({'ok': True})
+
 
 @app.route('/api/status', methods=['GET'])
 def svc_status():
