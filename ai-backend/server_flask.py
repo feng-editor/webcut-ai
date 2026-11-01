@@ -93,7 +93,7 @@ _RATE_RULES = {  # 端点前缀 → (次数, 窗口秒)
     '/api/ai/prompt': (30, 600),    # 30 次 / 10 分钟
     '/api/ai/storyboard': (10, 600),  # 10 次 / 10 分钟
     '/api/auth/register': (10, 3600),  # 注册限流：10 次 / 小时
-    '/api/ai/subtitle': (10, 600),     # 10 段 / 10 分钟
+    '/api/ai/subtitle': (60, 600),     # 60 段 / 10 分钟（8s 细分段 + VAD 跳空段）
 }
 _rate_hits = collections.defaultdict(collections.deque)  # (ip, prefix) → [timestamps]
 _rate_lock = threading.Lock()

@@ -6419,7 +6419,7 @@ var AI_FUNCS=[
   {key:'ck',cat:'智能处理',name:'AI 智能抠像',ic:'wand',state:'live',desc:'色度键抠除纯色背景（绿幕/蓝幕），GPU 着色器实时预览'},
   {key:'enhance',cat:'智能处理',name:'AI 视频增强',ic:'layers',state:'live',desc:'一键锐化+对比度增强（真实处理管线）；AI 超分开发中'},
   {key:'style',cat:'智能处理',name:'AI 风格转换',ic:'film',state:'live',desc:'调色风格预设（怀旧/赛博朋克等）；神经风格迁移开发中'},
-  {key:'sub',cat:'智能处理',name:'AI 智能字幕',ic:'type',state:'live',desc:'音频转文字（qwen-audio 转写，按 25s 分段对齐），自动铺装文字轨'},
+  {key:'sub',cat:'智能处理',name:'AI 智能字幕',ic:'type',state:'live',desc:'视频/音频转文字（8s 细分段+静音跳过），自动铺装文字轨'},
   {key:'bgrm',cat:'智能处理',name:'AI 背景移除',ic:'crop',state:'dev',desc:'需接入人像分割模型服务后开放'},
   {key:'idea',cat:'创作辅助',name:'AI 创意辅助',ic:'smile',state:'live',desc:'Qwen 把你的简短想法扩写成专业提示词'}
 ];
@@ -6597,14 +6597,21 @@ function envWavEncode(buf){ // AudioBuffer → 16bit PCM WAV（ASR 上传格式�
 }
 function aiPanelSub(main){
   var S=window.__EDITOR__.State;
+  // 视频（含音轨）与音频片段都可转写
   var clips=[];
   S.tracks.forEach(function(tr){
-    if(tr.type!=='audio')return;
-    S.clips.forEach(function(c){ if(c.trackId===tr.id&&c.sourceId)clips.push(c); });
+    if(tr.type!=='video'&&tr.type!=='audio')return;
+    S.clips.forEach(function(c){
+      if(c.trackId===tr.id&&c.sourceId){
+        var src=Engine.videoDecoder.__debug.sources[c.sourceId];
+        var hasAudio=(src&&(src.audioBuffer||src.audioStream))||(c.srcDuration&&tr.type==='audio');
+        if(hasAudio)clips.push(c);
+      }
+    });
   });
   var form=aiForm(main);
   if(!clips.length){
-    main.appendChild(el('div','aic-note','时间线上没有音频片段——先导入音频或使用 AI 配音生成一段。'));
+    main.appendChild(el('div','aic-note','时间线上没有可转写的音频——导入含音轨的视频、音频文件，或使用 AI 配音生成。'));
     return;
   }
   form.appendChild(el('div','field-label','选择要转写的音频片段'));
@@ -6615,7 +6622,7 @@ function aiPanelSub(main){
     sel.appendChild(o);
   });
   form.appendChild(sel);
-  var st=el('div','ai-status','转写为段级对齐（每 25 秒一段），语音间隙可能产生空段。');
+  var st=el('div','ai-status','8 秒细分段 + 静音自动跳过；段级对齐（±4s 内）。支持含音轨的视频片段。');
   main.appendChild(st);
   var err=el('div','ai-err');main.appendChild(err);
   var prog=el('div','ai-prog','<i></i>');main.appendChild(prog);
@@ -6677,7 +6684,7 @@ function aiPanelSub(main){
     run();
     function run(){
       var srcDur=buf?buf.duration:(c.srcDuration||c.duration);
-      var segLen=25,total=Math.min(c.duration,srcDur),segs=[];
+      var segLen=8,total=Math.min(c.duration,srcDur),segs=[];
       for(var t0=0;t0<total;t0+=segLen)segs.push({start:c.start+t0,end:c.start+Math.min(segLen,total-t0),src0:t0,src1:Math.min(segLen,total-t0)});
       var i=0;
       function next(){
@@ -6719,6 +6726,13 @@ function aiPanelSub(main){
         }
         tail.then(function(rendered){
           if(!rendered){i++;return next();}
+          // VAD：100ms 窗 RMS，全段静音则跳过转写（省调用）
+          var ch0=rendered.getChannelData(0),win=Math.floor(rendered.sampleRate*0.1),peak=0;
+          for(var wi=0;wi+win<ch0.length;wi+=win){
+            var s3=0;for(var si=wi;si<wi+win;si+=8)s3+=ch0[si]*ch0[si];
+            var rms=Math.sqrt(s3/(win/8));if(rms>peak)peak=rms;
+          }
+          if(peak<0.004){results.push({start:sg.start,end:sg.end,text:''});i++;renderResults();next();return;}
           var wav=envWavEncode(rendered);
           var b64='';
           // File → base64（分块避免栈溢出）
