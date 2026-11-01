@@ -93,6 +93,7 @@ _RATE_RULES = {  # 端点前缀 → (次数, 窗口秒)
     '/api/ai/prompt': (30, 600),    # 30 次 / 10 分钟
     '/api/ai/storyboard': (10, 600),  # 10 次 / 10 分钟
     '/api/auth/register': (10, 3600),  # 注册限流：10 次 / 小时
+    '/api/ai/subtitle': (10, 600),     # 10 段 / 10 分钟
 }
 _rate_hits = collections.defaultdict(collections.deque)  # (ip, prefix) → [timestamps]
 _rate_lock = threading.Lock()
@@ -441,6 +442,59 @@ def create_image_task():
 
     except Exception as e:
         print(f'!!!! [T2I] 异常: {e} !!!!', flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================
+# AI 智能字幕（qwen-audio-turbo 音频转写；前端分段，每段 ≤25s）
+# ============================================================
+ASR_MODEL = cfg('AI_ASR_MODEL', 'qwen-audio-turbo')
+
+@app.route('/api/ai/subtitle', methods=['POST'])
+def ai_subtitle():
+    print('>>> [ASR] 收到字幕转写请求 <<<', flush=True)
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        audio_b64 = (data.get('audio') or '').strip()
+        if audio_b64.startswith('data:'):
+            audio_b64 = audio_b64.split(',', 1)[1]
+        if not audio_b64:
+            return jsonify({'error': 'audio 不能为空（base64 WAV）'}), 400
+        if len(audio_b64) > 12 * 1024 * 1024:
+            return jsonify({'error': '音频分段过大（>9MB），请缩短分段时长'}), 400
+
+        u = _auth_user()
+        if u and not _spend_credits(u['id'], CREDIT_COST.get('subtitle', 1)):
+            return jsonify({'error': f'AI 积分不足（本次需 {CREDIT_COST.get("subtitle", 1)}）'}), 402
+
+        url = DASHSCOPE_BASE + '/api/v1/services/aigc/multimodal-generation/generation'
+        headers = {'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json'}
+        payload = {
+            'model': ASR_MODEL,
+            'input': {'messages': [
+                {'role': 'user', 'content': [
+                    {'type': 'audio', 'audio': 'data:audio/wav;base64,' + audio_b64},
+                    {'type': 'text', 'text': '请逐字转写这段音频中的语音内容。只输出转写文本本身；'
+                                             '如果没有语音，只输出空。不要解释，不要添加标点以外的内容。'}
+                ]}
+            ]},
+            'parameters': {'result_format': 'message', 'max_tokens': 400}
+        }
+        resp = req_lib.post(url, headers=headers, json=payload, timeout=90)
+        if resp.status_code != 200:
+            human = _translate_upstream_error(resp.text)
+            return jsonify({'error': human or f'阿里云返回 {resp.status_code}: {resp.text[:200]}'}), 502
+        txt = (((resp.json().get('output') or {}).get('choices') or [{}])[0].get('message') or {}).get('content')
+        if isinstance(txt, list):
+            txt = ' '.join((x or {}).get('text', '') for x in txt)
+        txt = (txt or '').strip()
+        if txt in ('空', '。', '（无语音）', '（无语音内容）'):
+            txt = ''
+        print(f'>>> [ASR] 转写完成: {txt[:50]} <<<', flush=True)
+        return jsonify({'text': txt})
+
+    except Exception as e:
+        print(f'!!!! [ASR] 异常: {e} !!!!', flush=True)
         return jsonify({'error': str(e)}), 500
 
 
@@ -844,7 +898,7 @@ def _spend_credits(user_id, amount):
     con.commit(); con.close()
     return True
 
-CREDIT_COST = {'video': 20, 'image': 5, 'tts': 2, 'storyboard': 1}
+CREDIT_COST = {'video': 20, 'image': 5, 'tts': 2, 'storyboard': 1, 'subtitle': 1}
 
 @app.route('/api/auth/register', methods=['POST'])
 def auth_register():

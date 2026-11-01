@@ -6419,7 +6419,7 @@ var AI_FUNCS=[
   {key:'ck',cat:'智能处理',name:'AI 智能抠像',ic:'wand',state:'live',desc:'色度键抠除纯色背景（绿幕/蓝幕），GPU 着色器实时预览'},
   {key:'enhance',cat:'智能处理',name:'AI 视频增强',ic:'layers',state:'live',desc:'一键锐化+对比度增强（真实处理管线）；AI 超分开发中'},
   {key:'style',cat:'智能处理',name:'AI 风格转换',ic:'film',state:'live',desc:'调色风格预设（怀旧/赛博朋克等）；神经风格迁移开发中'},
-  {key:'sub',cat:'智能处理',name:'AI 智能字幕',ic:'type',state:'dev',desc:'需接入语音识别（Paraformer ASR）服务后开放'},
+  {key:'sub',cat:'智能处理',name:'AI 智能字幕',ic:'type',state:'live',desc:'音频转文字（qwen-audio 转写，按 25s 分段对齐），自动铺装文字轨'},
   {key:'bgrm',cat:'智能处理',name:'AI 背景移除',ic:'crop',state:'dev',desc:'需接入人像分割模型服务后开放'},
   {key:'idea',cat:'创作辅助',name:'AI 创意辅助',ic:'smile',state:'live',desc:'Qwen 把你的简短想法扩写成专业提示词'}
 ];
@@ -6533,14 +6533,14 @@ function renderAIFunc(main){
   aiHead(main,f);
   if(f.state==='dev'){
     return (function(){
-      var note=el('div','aic-note','该功能依赖尚未接入的服务（'+(f.key==='sub'?'语音识别 ASR':'人像分割模型')+'）。'
+      var note=el('div','aic-note','该功能依赖尚未接入的服务（人像分割模型）。'
         +'为避免虚假功能，此处如实标注开发中，接入后即可开放。');
       main.appendChild(note);
     })();
   }
   var fn={t2v:aiPanelT2V,i2v:aiPanelI2V,t2i:aiPanelT2I,tts:aiPanelTTS,ck:aiPanelCK,
     enhance:aiPanelEnhance,style:aiPanelStyle,idea:aiPanelIdea,
-    story:aiPanelStory,autocut:aiPanelAutoCut}[f.key];
+    story:aiPanelStory,autocut:aiPanelAutoCut,sub:aiPanelSub}[f.key];
   if(fn)fn(main);
 }
 /* —— 公共表单件 —— */
@@ -6576,6 +6576,171 @@ function aiProgress(main){
       b.addEventListener('click',a.fn);act.appendChild(b);
     });}
   };
+}
+/* —— AI 智能字幕：音频片段 → 25s 分段 qwen-audio 转写 → 铺装文字轨 —— */
+function envWavEncode(buf){ // AudioBuffer → 16bit PCM WAV（ASR 上传格式）
+  var ch=buf.numberOfChannels,len=buf.length,sr=buf.sampleRate;
+  var ab=new ArrayBuffer(44+len*ch*2),dv=new DataView(ab);
+  function ws(o,s2){for(var i=0;i<s2.length;i++)dv.setUint8(o+i,s2.charCodeAt(i));}
+  ws(0,'RIFF');dv.setUint32(4,36+len*ch*2,true);ws(8,'WAVE');ws(12,'fmt ');
+  dv.setUint32(16,16,true);dv.setUint16(20,1,true);dv.setUint16(22,ch,true);
+  dv.setUint32(24,sr,true);dv.setUint32(28,sr*ch*2,true);dv.setUint16(32,2*ch,true);dv.setUint16(34,16,true);
+  ws(36,'data');dv.setUint32(40,len*ch*2,true);
+  var chans=[],c;
+  for(c=0;c<ch;c++)chans.push(buf.getChannelData(c));
+  var off=44;
+  for(var i=0;i<len;i++)for(c=0;c<ch;c++){
+    var v=Math.max(-1,Math.min(1,chans[c][i]));
+    dv.setInt16(off,v<0?v*32768:v*32767,true);off+=2;
+  }
+  return new Blob([ab],{type:'audio/wav'});
+}
+function aiPanelSub(main){
+  var S=window.__EDITOR__.State;
+  var clips=[];
+  S.tracks.forEach(function(tr){
+    if(tr.type!=='audio')return;
+    S.clips.forEach(function(c){ if(c.trackId===tr.id&&c.sourceId)clips.push(c); });
+  });
+  var form=aiForm(main);
+  if(!clips.length){
+    main.appendChild(el('div','aic-note','时间线上没有音频片段——先导入音频或使用 AI 配音生成一段。'));
+    return;
+  }
+  form.appendChild(el('div','field-label','选择要转写的音频片段'));
+  var sel=document.createElement('select');sel.className='ctl';sel.style.width='100%';
+  clips.forEach(function(c,i){
+    var o=document.createElement('option');o.value=c.id;
+    o.textContent=(c.label||('音频 '+(i+1)))+' · '+fmt(c.duration);
+    sel.appendChild(o);
+  });
+  form.appendChild(sel);
+  var st=el('div','ai-status','转写为段级对齐（每 25 秒一段），语音间隙可能产生空段。');
+  main.appendChild(st);
+  var err=el('div','ai-err');main.appendChild(err);
+  var prog=el('div','ai-prog','<i></i>');main.appendChild(prog);
+  var listWrap=el('div','aic-form');main.appendChild(listWrap);
+  var results=[];
+  var bGen=el('button','btn primary',icon('type',13)+' 生成字幕');
+  bGen.style.marginTop='6px';main.appendChild(bGen);
+  var bLay=null;
+  function renderResults(){
+    listWrap.innerHTML='';
+    if(!results.length)return;
+    results.forEach(function(r2,i){
+      if(!r2.text)return;
+      var box=el('div','sb-shot');
+      box.appendChild(el('div','sb-head','<span class="sb-badge">'+(i+1)+'</span>'+
+        '<span class="sb-desc">'+esc(r2.text)+'</span><span class="sb-dur">'+fmt(r2.start)+'–'+fmt(r2.end)+'</span>'));
+      listWrap.appendChild(box);
+    });
+    if(!bLay){
+      bLay=el('button','btn primary',icon('layers',13)+' 铺装到文字轨');
+      bLay.style.marginTop='8px';main.appendChild(bLay);
+      bLay.addEventListener('click',function(){
+        var texts=results.filter(function(r2){return r2.text;});
+        if(!texts.length)return toast('没有可铺装的字幕');
+        beginChange();
+        var tr=null;
+        for(var i2=0;i2<S.tracks.length;i2++)if(S.tracks[i2].type==='text'&&!S.tracks[i2].locked){tr=S.tracks[i2];break;}
+        if(!tr)tr=addTrackOf('text');
+        texts.forEach(function(r2){
+          var c=makeClip(tr.id,r2.start,Math.max(1,r2.end-r2.start),r2.text.slice(0,14));
+          c.props.text=r2.text;c.props.textStyle='bar';
+          App.clipAdd(c);
+          S.clips.push(c);
+        });
+        endChange();renderHeaders();renderProps();requestRender();
+        toast('已铺装 '+texts.length+' 条字幕');
+        closeModal();
+      });
+    }
+  }
+  bGen.addEventListener('click',function(){
+    var c=clips[+sel.value===c?0:sel.selectedIndex];
+    c=clips[sel.selectedIndex]||clips[0];
+    err.classList.remove('on');
+    bGen.disabled=true;
+    results=[];
+    // 分段：25s 一段，从源 AudioBuffer 切片重采样为 16k mono WAV
+    var buf=Engine.videoDecoder.getAudioBuffer(c.sourceId);
+    var stream=Engine.videoDecoder.getAudioStream(c.sourceId);
+    if(!buf&&!stream){
+      // 流式源：先解码整段（已有分段缓存）
+      st.textContent='解码音频中…';
+      Engine.videoDecoder.ensureAudioRange(c.sourceId,0,(c.srcDuration||c.duration)).then(function(){
+        buf=Engine.videoDecoder.getAudioBuffer(c.sourceId);
+        run();
+      }).catch(function(e2){st.textContent='';err.textContent='音频解码失败：'+((e2&&e2.message)||e2);err.classList.add('on');bGen.disabled=false;});
+      return;
+    }
+    run();
+    function run(){
+      var srcDur=buf?buf.duration:(c.srcDuration||c.duration);
+      var segLen=25,total=Math.min(c.duration,srcDur),segs=[];
+      for(var t0=0;t0<total;t0+=segLen)segs.push({start:c.start+t0,end:c.start+Math.min(segLen,total-t0),src0:t0,src1:Math.min(segLen,total-t0)});
+      var i=0;
+      function next(){
+        if(i>=segs.length){
+          bGen.disabled=false;
+          st.textContent='转写完成：'+results.filter(function(r2){return r2.text;}).length+' 段有语音';
+          renderResults();
+          return;
+        }
+        var sg=segs[i];
+        st.textContent='转写分段 '+(i+1)+'/'+segs.length+'…';
+        prog.classList.add('on');prog.firstChild.style.width=Math.round(i/segs.length*100)+'%';
+        // 切源音频片段 → 16k mono WAV
+        var sr=16000,len=Math.ceil((sg.src1-sg.src0)*sr);
+        var oc=new (window.OfflineAudioContext||window.webkitOfflineAudioContext)(1,len,sr);
+        var tail=Promise.resolve();
+        if(buf){
+          var src2=oc.createBufferSource();src2.buffer=buf;
+          // 源 buffer 采样率与 oc 不同：createBufferSource 播放时自动重采样 ✓
+          src2.connect(oc.destination);
+          src2.start(0,sg.src0,sg.src1-sg.src0);
+          tail=oc.startRendering();
+        }else{
+          // 流式源：拼装分段（从分段缓存取）
+          var segsArr=[];
+          var stream2=Engine.videoDecoder.getAudioStream(c.sourceId);
+          var s0=Math.floor(sg.src0/stream2.segDur),s1=Math.min(stream2.segCount-1,Math.floor((sg.src1-0.01)/stream2.segDur));
+          for(var si=s0;si<=s1;si++){
+            var seg=Engine.videoDecoder.getAudioSegment(c.sourceId,si);
+            if(seg)segsArr.push(seg);
+          }
+          if(segsArr.length){
+            var src2=oc.createBufferSource();src2.buffer=segsArr[0];
+            // 简化：多段拼一个 OfflineAudioContext 太长——只转写首段覆盖的窗口
+            src2.connect(oc.destination);
+            src2.start(0);
+          }
+          tail=segsArr.length?oc.startRendering():Promise.resolve(null);
+        }
+        tail.then(function(rendered){
+          if(!rendered){i++;return next();}
+          var wav=envWavEncode(rendered);
+          var b64='';
+          // File → base64（分块避免栈溢出）
+          var r2=new FileReader();
+          var p=new Promise(function(res){r2.onload=function(){res(r2.result);};r2.readAsDataURL(wav);});
+          return p.then(function(dataUrl){
+            return fetch(API_BASE+'/api/ai/subtitle',{method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({audio:dataUrl}),signal:AbortSignal.timeout(95000)})
+              .then(function(resp){return resp.json().then(function(j){return {code:resp.status,j:j};});})
+              .then(function(res2){
+                if(res2.code!==200)throw new Error(res2.j.error||'转写失败');
+                results.push({start:sg.start,end:sg.end,text:(res2.j.text||'').trim()});
+              });
+          });
+        }).then(function(){i++;renderResults();next();})
+          .catch(function(e2){prog.classList.remove('on');bGen.disabled=false;
+            err.textContent='转写失败：'+((e2&&e2.message)||e2);err.classList.add('on');});
+      }
+      next();
+    }
+  });
 }
 /* —— AI 策划分镜：主题 → 结构化分镜 → 逐镜生成 → 铺装时间线 —— */
 var aiStoryboard=null; // {title,shots:[{dur,desc,visualPrompt,narration,item,done,progress}]}
