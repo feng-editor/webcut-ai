@@ -1424,6 +1424,38 @@ def upload_finish(upload_id):
                     'mime': meta['mime'], 'size': meta['size']})
 
 
+@app.route('/api/admin/stats', methods=['GET'])
+def admin_stats():
+    if not ADMIN_TOKEN or request.headers.get('X-Admin-Token', '') != ADMIN_TOKEN:
+        return jsonify({'error': '未授权'}), 401
+    con = _db()
+    users_total = con.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+    users_today = con.execute('SELECT COUNT(*) FROM users WHERE created_at > ?', (time.time() - 86400,)).fetchone()[0]
+    logins_today = con.execute('SELECT COUNT(*) FROM sessions WHERE created_at > ?', (time.time() - 86400,)).fetchone()[0]
+    projects_total = con.execute('SELECT COUNT(*) FROM cloud_projects').fetchone()[0]
+    credits_spent = con.execute('SELECT COALESCE(SUM(-delta),0) FROM credit_ledger WHERE delta < 0').fetchone()[0]
+    credits_bought = con.execute('SELECT COALESCE(SUM(delta),0) FROM credit_ledger WHERE delta > 0').fetchone()[0]
+    con.close()
+    with _db_lock:
+        db = _db_load()
+    orders_total = len(db.get('orders', {}))
+    orders_paid = sum(1 for o in db.get('orders', {}).values() if o.get('status') == 'paid')
+    with TASKS_LOCK:
+        tasks_running = sum(1 for t in TASKS.values() if t['status'] == 'running')
+        tasks_total = len(TASKS)
+    db_size = 0
+    try: db_size = os.path.getsize(DB_PATH)
+    except Exception: pass
+    return jsonify({
+        'users': {'total': users_total, 'today': users_today, 'loginsToday': logins_today},
+        'projects': {'total': projects_total},
+        'credits': {'bought': credits_bought, 'spent': credits_spent},
+        'orders': {'total': orders_total, 'paid': orders_paid},
+        'ai': {'tasksRunning': tasks_running, 'tasksTotal': tasks_total},
+        'system': {'dbSize': db_size, 'uptime': round(time.time() - _STARTED)},
+    })
+
+
 @app.route('/api/admin/backups', methods=['GET'])
 def admin_backups():
     if not ADMIN_TOKEN or request.headers.get('X-Admin-Token', '') != ADMIN_TOKEN:
@@ -1467,6 +1499,68 @@ def auth_deactivate():
     except Exception: pass
     print(f'[auth] 注销并删除数据: uid={u["id"]}', flush=True)
     return jsonify({'ok': True})
+
+
+@app.route('/privacy', methods=['GET'])
+@app.route('/privacy.html', methods=['GET'])
+def privacy_page():
+    return '''<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>隐私政策 - WebCut</title><style>
+body{background:#0e1013;color:#e8eaee;font-family:system-ui,sans-serif;max-width:720px;margin:0 auto;padding:40px 20px;line-height:1.8}
+h1{font-size:22px;border-bottom:1px solid #262b33;padding-bottom:12px}h2{font-size:16px;margin-top:28px;color:#6db2ff}
+p,li{font-size:14px;color:#9aa3af}a{color:#6db2ff}
+.hl{color:#e6b455}
+.icp{text-align:center;margin-top:40px;font-size:12px;color:#464c78}
+</style></head><body>
+<h1>WebCut 隐私政策</h1>
+<p>最后更新：2026 年 11 月 1 日</p>
+
+<h2>一、我们收集什么</h2>
+<ul>
+<li>账号信息：注册时提供的电子邮箱地址和加密后的密码（PBKDF2-HMAC-SHA256 十万次迭代，不存储明文）</li>
+<li>工程数据：您保存在云端的视频剪辑工程（时间线结构、片段属性），<span class="hl">不包含原始视频文件内容</span></li>
+<li>云端媒体：您主动上传到云端素材库的视频/音频文件副本</li>
+<li>使用统计：AI 功能调用次数（用于积分扣减与配额管理），<span class="hl">不包含工程内容或个人信息</span></li>
+</ul>
+
+<h2>二、我们如何使用</h2>
+<ul>
+<li>账号凭据仅用于身份验证（会话 token 30 天滑动过期）</li>
+<li>云端工程与媒体仅限您本人访问（按用户 ID 隔离）</li>
+<li>AI 积分消费记录用于计费透明度</li>
+<li><span class="hl">我们不会将您的工程内容、上传素材或个人信息提供给第三方用于广告或数据挖掘</span></li>
+</ul>
+
+<h2>三、AI 生成内容说明</h2>
+<ul>
+<li>AI 生成功能（文生视频/图片/配音/字幕/分镜）调用阿里云 DashScope API</li>
+<li>您的提示词与上传素材会通过 API 传输至阿里云进行处理，处理过程受<span class="hl">阿里云隐私政策</span>约束</li>
+<li>AI 生成的视频/图片/音频<span class="hl">归您所有</span>，但您需自行确认内容合法性</li>
+<li><span class="hl">严禁使用 AI 生成侵犯他人版权、肖像权或违反法律法规的内容</span></li>
+</ul>
+
+<h2>四、数据存储与安全</h2>
+<ul>
+<li>用户数据存储在 SQLite 数据库（AES 加密传输，WAL 模式）</li>
+<li>密码不可逆加密存储（即使数据库泄露也无法还原明文密码）</li>
+<li>每日自动备份保留最近 7 份</li>
+<li>API 密钥仅存于服务端 .env（已通过静态文件黑名单阻止泄露）</li>
+</ul>
+
+<h2>五、您的权利</h2>
+<ul>
+<li>您可随时导出全部工程数据（项目管理器 → 导出 JSON）</li>
+<li>您可随时<span class="hl">注销账号</span>——注销后全部云端数据（工程/媒体/积分/流水）将被永久删除且不可恢复</li>
+<li>您也可选择不上传任何数据，仅使用本地编辑模式（IndexedDB 存储）</li>
+</ul>
+
+<h2>六、联系方式</h2>
+<p>如对隐私政策有疑问，请联系：privacy@webcut.app（占位）</p>
+
+<div class="icp">WebCut — 下一代 AI 驱动的专业视频创作平台<br>
+<span class="hl">ICP 备案号：待部署后填写（占位）</span></div>
+</body></html>'''
 
 
 @app.route('/api/status', methods=['GET'])

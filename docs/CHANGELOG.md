@@ -330,3 +330,20 @@ uid 目录跨会话读回 ✓；新设备模拟全链路（导入→云推→清
 
 ### selftest 扩展
 - 新增 3 用例（转场混合/文字动画/AudioFX 模块）+ 支付幂等/上传秒传/备份 → 总计 22/22 全绿
+
+## v1.6.0（2026-11-01）运营合规 + 背景移除
+
+### P3-12 隐私政策页
+- /privacy 静态页面：数据收集/使用/AI 生成内容版权/数据安全/用户权利
+- ICP 备案占位提示（部署后填写）
+- 用户菜单「隐私政策」入口
+
+### P3-13 数据后台（admin stats）
+- GET /api/admin/stats：用户/工程/积分/订单/AI 任务/系统指标
+- ADMIN_TOKEN 保护（.env 配置）
+
+### P2-9 AI 背景移除（MediaPipe 本地推理）
+- 从「开发中」转为「可用」：MediaPipe ImageSegmenter（SelfieSegmenter）
+- 按需 CDN 加载 WASM 运行时 + 模型（约 250KB，首次使用下载后本地推理）
+- EffectPipe destination-in 合成（预览=导出）；自动抠人像
+- 如实标注：CDN 加载失败时如实提示（需网络）；当前仅支持人像分割

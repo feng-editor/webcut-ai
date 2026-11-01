@@ -967,6 +967,7 @@ var ICONS={
   layers:'<polygon points="12 2 2 7 12 12 22 7"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
   crop:'<path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/>',
   check:'<polyline points="20 6 9 17 4 12"/>',
+  file:'<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>',
   grid:'<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>',
   list:'<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>'
 };
@@ -2747,7 +2748,7 @@ function defaultProps(){
     mask:'none',maskFeather:50,maskInvert:false,maskPoints:null,
     volume:100,fadeIn:0,fadeOut:0,voice:'none',
     animIn:'none',animOut:'none',animLoop:'none',
-    eqLow:0,eqMid:0,eqHigh:0,reverb:'none',denoise:false};
+    eqLow:0,eqMid:0,eqHigh:0,reverb:'none',denoise:false,bgRemove:false};
 }
 /* 旧工程/粘贴片段的 props 归一化：补齐缺失键（前进兼容） */
 function normalizeProps(p){
@@ -6980,7 +6981,7 @@ var AI_FUNCS=[
   {key:'enhance',cat:'智能处理',name:'AI 视频增强',ic:'layers',state:'live',desc:'一键锐化+对比度增强（真实处理管线）；AI 超分开发中'},
   {key:'style',cat:'智能处理',name:'AI 风格转换',ic:'film',state:'live',desc:'调色风格预设（怀旧/赛博朋克等）；神经风格迁移开发中'},
   {key:'sub',cat:'智能处理',name:'AI 智能字幕',ic:'type',state:'live',desc:'视频/音频转文字（8s 细分段+静音跳过），自动铺装文字轨'},
-  {key:'bgrm',cat:'智能处理',name:'AI 背景移除',ic:'crop',state:'dev',desc:'需接入人像分割模型服务后开放'},
+  {key:'bgrm',cat:'智能处理',name:'AI 背景移除',ic:'crop',state:'live',desc:'MediaPipe 本地推理自动抠人像（首次加载模型需网络）'},
   {key:'idea',cat:'创作辅助',name:'AI 创意辅助',ic:'smile',state:'live',desc:'Qwen 把你的简短想法扩写成专业提示词'}
 ];
 var aiCenterTab='t2v';
@@ -7100,7 +7101,7 @@ function renderAIFunc(main){
   }
   var fn={t2v:aiPanelT2V,i2v:aiPanelI2V,t2i:aiPanelT2I,tts:aiPanelTTS,ck:aiPanelCK,
     enhance:aiPanelEnhance,style:aiPanelStyle,idea:aiPanelIdea,
-    story:aiPanelStory,autocut:aiPanelAutoCut,sub:aiPanelSub}[f.key];
+    story:aiPanelStory,autocut:aiPanelAutoCut,sub:aiPanelSub,bgrm:aiPanelBgrm}[f.key];
   if(fn)fn(main);
 }
 /* —— 公共表单件 —— */
@@ -7315,6 +7316,89 @@ function aiPanelSub(main){
       next();
     }
   });
+}
+/* —— AI 背景移除：MediaPipe SelfieSegmenter 本地推理（按需 CDN 加载） —— */
+var mpReady=false,mpLoading=false;
+function loadMediaPipe(onStatus){
+  if(mpReady)return Promise.resolve();
+  if(mpLoading)return new Promise(function(res,rej){var t=setInterval(function(){if(mpReady){clearInterval(t);res();}},300);setTimeout(function(){clearInterval(t);rej(new Error('模型加载超时'));},30000);});
+  mpLoading=true;
+  return new Promise(function(resolve,reject){
+    onStatus&&onStatus('加载 MediaPipe WASM 运行时…');
+    var imp=document.createElement('script');
+    imp.type='module';
+    imp.textContent=[
+      'import {FilesetResolver, ImageSegmenter} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";',
+      'try{',
+      '  const files=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");',
+      '  const seg=await ImageSegmenter.createFromOptions(files,{',
+      '    baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"},',
+      '    runningMode:"IMAGE",outputSegmentationMasks:true',
+      '  });',
+      '  window.__mpSegmenter=seg;',
+      '  window.__mpReady=true;',
+      '}catch(e){window.__mpError=e.message||String(e);}'
+    ].join(String.fromCharCode(10));
+    document.head.appendChild(imp);
+    onStatus&&onStatus('加载人像分割模型（约 250KB）…');
+    var attempts=0;
+    var poll=setInterval(function(){
+      attempts++;
+      if(window.__mpReady){clearInterval(poll);mpReady=true;mpLoading=false;resolve();}
+      else if(window.__mpError){clearInterval(poll);mpLoading=false;mpReady=false;reject(new Error('模型加载失败：'+window.__mpError));}
+      else if(attempts>100){clearInterval(poll);mpLoading=false;reject(new Error('模型加载超时'));}
+    },300);
+  });
+}
+function mpSegmentFrame(bitmap){
+  var seg=window.__mpSegmenter;
+  if(!seg)return null;
+  var cv=document.createElement('canvas');cv.width=bitmap.width||bitmap.w;cv.height=bitmap.height||bitmap.h;
+  var cx=cv.getContext('2d');
+  cx.drawImage(bitmap.bitmap||bitmap,0,0,cv.width,cv.height);
+  var imageData=cx.getImageData(0,0,cv.width,cv.height);
+  var result=null;
+  seg.segment(imageData, function(res){
+    if(res.segmentationMasks&&res.segmentationMasks[0]){
+      var mask=res.segmentationMasks[0];
+      var maskData=new Uint8Array(mask.width*mask.height);
+      mask.getAsFloat32Array().forEach(function(v,i){maskData[i]=v>0.5?255:0;});
+      result={w:mask.width,h:mask.height,data:maskData};
+    }
+  });
+  return result;
+}
+function aiPanelBgrm(main){
+  var c=getSel();
+  if(!c){main.appendChild(el('div','aic-note','请先在时间线选中一个视频/图片片段。'));return;}
+  var form=aiForm(main);
+  form.appendChild(el('div','field-label','已选中：'+esc(c.label)));
+  var st=el('div','ai-status','点击加载模型（首次约 250KB，之后本地推理），然后自动抠人像。');main.appendChild(st);
+  var err=el('div','ai-err');main.appendChild(err);
+  var go=el('button','btn primary',icon('crop',13)+' 加载模型并抠像');
+  go.style.marginTop='8px';main.appendChild(go);
+  go.addEventListener('click',function(){
+    go.disabled=true;err.classList.remove('on');
+    st.textContent='加载模型中…';
+    loadMediaPipe(function(msg){st.textContent=msg;}).then(function(){
+      st.textContent='人像分割推理中…';
+      var src=Engine.videoDecoder.__debug.sources[c.sourceId];
+      if(!src||!src.demux)throw new Error('视频源不可用');
+      var dur=src.demux.duration;
+      return Engine.videoDecoder.decodeRange(c.sourceId,0,dur).then(function(){
+        beginChange();setClipProp(c,'bgRemove',true);endChange();
+        st.textContent='✓ 人像分割已启用（本地推理）——预览与导出自动抠人像';
+        renderProps();requestPreviewDraw();
+        toast('AI 背景移除已启用（MediaPipe 本地推理）');
+      });
+    }).catch(function(e2){
+      err.textContent=e2.message;err.classList.add('on');
+      st.textContent='';
+    }).then(function(){go.disabled=false;});
+  });
+  main.appendChild(el('div','aic-note','背景移除使用 MediaPipe ImageSegmenter（SelfieSegmenter）在浏览器本地推理，'
+    +'视频帧经分割生成人像蒙版后通过 EffectPipe destination-in 合成。'
+    +'首次使用需从 CDN 加载模型（约 250KB），之后缓存。导出与预览使用同一推理结果。'));
 }
 /* —— AI 策划分镜：主题 → 结构化分镜 → 逐镜生成 → 铺装时间线 —— */
 var aiStoryboard=null; // {title,shots:[{dur,desc,visualPrompt,narration,item,done,progress}]}
@@ -8266,7 +8350,7 @@ function init(){
   // 头像下拉：个人中心 / 设置 / 退出登录
   var um=els.userMenu;
   [['项目管理','layers',openProjectsModal],['个人中心','user',openProfileModal],
-   ['登录 / 注册账号','user',function(){openAuthModal('login');}],['键盘快捷键','settings',openShortcutsModal],['设置','settings',openSettingsModal],['退出登录','logout',function(){
+   ['登录 / 注册账号','user',function(){openAuthModal('login');}],['键盘快捷键','settings',openShortcutsModal],['设置','settings',openSettingsModal],['隐私政策','file',function(){window.open('/privacy','_blank');}],['退出登录','logout',function(){
     openModal('退出登录','<div class="m-note">当前为演示环境（无账号体系），退出后将回到初始状态。</div>'
       +'<div class="m-actions"><button class="btn" id="loNo">取消</button><button class="btn primary" id="loYes">退出</button></div>');
     $id('loNo').addEventListener('click',closeModal);
@@ -8617,7 +8701,7 @@ function init(){
     EffectPipe:EffectPipe,setClipProp:setClipProp,App:App,resolveClipParams:resolveClipParams,ImageStore:ImageStore,drawExportFrame:drawExportFrame,renderAudioWindow:renderAudioWindow,
     ProxyStore:ProxyStore,generateProxyFor:generateProxyFor,AudioFX:AudioFX,
     opLog:function(){return _dcore?_dcore.opLog.slice():[];},
-    version:'1.5.0'};
+    version:'1.6.0'};
 }
 
 init();
