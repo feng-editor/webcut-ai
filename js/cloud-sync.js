@@ -75,7 +75,8 @@ window.WebCutCloud=function(deps){
     });
   }
   function pushStructure(rec){
-    return fetch(API_BASE + '/api/cloud/project',{method:'PUT',
+    var pkey=(ProjectStore.currentPid?ProjectStore.currentPid():'main');
+    return fetch(API_BASE + '/api/cloud/project?key='+encodeURIComponent(pkey),{method:'PUT',
       headers:Object.assign({'Content-Type':'application/json'},hdrs()),
       body:JSON.stringify(rec),signal:AbortSignal.timeout(20000)})
       .then(function(r){return r.ok;}).catch(function(){return false;});
@@ -149,7 +150,8 @@ window.WebCutCloud=function(deps){
   function pull(){
     return available().then(function(ok){
       if(!ok)return false;
-      return fetch(API_BASE + '/api/cloud/project',{headers:hdrs(),signal:AbortSignal.timeout(15000)})
+      var pkey=(ProjectStore.currentPid?ProjectStore.currentPid():'main');
+    return fetch(API_BASE + '/api/cloud/project?key='+encodeURIComponent(pkey),{headers:hdrs(),signal:AbortSignal.timeout(15000)})
         .then(function(r){
           if(!r.ok)throw new Error('云端暂无备份');
           return r.json();

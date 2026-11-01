@@ -2231,7 +2231,7 @@ var PayClient=(function(){
    ============================================================ */
 var ProjectStore=(function(){
   var DB='webcut',KV='kv',MEDIA='media',dbp=null;
-  var savedMedia={},saveTimer=null,noSave=false;
+  var savedMedia={},savedProxy={},saveTimer=null,noSave=false;
   /* ---------- 多项目管理：'project-index' 存清单，'project:<id>' 存各项目，滚动保留 5 个版本 ---------- */
   var VERSIONS=5;
   function currentPid(){
@@ -2375,6 +2375,12 @@ var ProjectStore=(function(){
         audioPcm:m.audioPcm,audioSr:m.audioSr}));
       savedMedia[sid]=1;
     });
+    ProxyStore.all().forEach(function(pr){
+      var key='proxy:'+pr.sid;
+      if(savedProxy[key])return;
+      ps.push(put(MEDIA,key,{id:key,blob:pr.file,name:'proxy',mime:'video/mp4'}));
+      savedProxy[key]=1;
+    });
     ps.push(updateIndex(kvRec));
     return Promise.all(ps).then(function(){
       markSaved('已保存');
@@ -2478,6 +2484,24 @@ var ProjectStore=(function(){
         State.selection=null;State.selKF=null;
         undoStack.length=0;redoStack.length=0;updateHistoryButtons();
         Object.keys(map).forEach(function(old){savedMedia[map[old]]=1;}); // 媒体已在库，恢复后不重写
+        // 代理重挂：旧 sid 的代理文件 → probe 注册 → 绑定到新 sid（异步，不阻塞恢复）
+        (function(){
+          var pchain=Promise.resolve();
+          Object.keys(map).forEach(function(old){
+            var nsid=map[old];
+            pchain=pchain.then(function(){
+              return get(MEDIA,'proxy:'+old).then(function(pr){
+                if(!pr||!pr.blob||ProxyStore.get(nsid))return;
+                return Engine.videoDecoder.probe(pr.blob).then(function(pm){
+                  if(pm&&pm.sourceId){
+                    ProxyStore.mark(nsid,{proxySid:pm.sourceId,active:true,progress:1,done:true,file:pr.blob});
+                    savedProxy['proxy:'+old]=1;
+                  }
+                });
+              }).catch(function(){});
+            });
+          });
+        })();
         renderHeaders();renderProps();syncZoomUI();clampScroll();
         layoutStage();requestRender();
         toast('已恢复工程（'+State.clips.length+' 个片段）');
@@ -2881,7 +2905,8 @@ var ProxyStore=(function(){
   function get(sid){return map[sid]||null;}
   function mark(sid,rec){map[sid]=rec;}
   function setExporting(v){exporting=v;}
-  return {active:active,proxySid:proxySid,get:get,mark:mark,setExporting:setExporting};
+  function all(){var out=[];for(var k in map){var r2=map[k];if(r2.done&&r2.file)out.push({sid:k,file:r2.file});}return out;}
+  return {active:active,proxySid:proxySid,get:get,mark:mark,setExporting:setExporting,all:all};
 })();
 /* 代理生成：原文件逐帧解码 → 540p 画布 → 30fps 网格采样 H.264 → MP4 → 注册为镜像解码源 */
 function generateProxyFor(sid,onProgress){
@@ -2900,7 +2925,7 @@ function generateProxyFor(sid,onProgress){
   var H=Math.min(540,oh);if(H%2)H--;var W=Math.round(ow*H/oh/2)*2;
   if(W>=ow)return Promise.reject(new Error('原始分辨率已较低（'+ow+'×'+oh+'），无需代理'));
   var fps=30,N=Math.max(1,Math.min(3600,Math.round(dur*fps)));
-  var rec={proxySid:null,active:false,progress:0,done:false};
+  var rec={proxySid:null,active:false,progress:0,done:false,file:null};
   ProxyStore.mark(sid,rec);
   var cv=document.createElement('canvas');cv.width=W;cv.height=H;
   var cx=cv.getContext('2d');
@@ -2958,6 +2983,7 @@ function generateProxyFor(sid,onProgress){
             if(!desc){done=true;reject(new Error('编码器未返回描述'));return;}
             var mp4=muxMp4FromChunks(frames,W,H,desc);
             var pf=new File([mp4],'proxy.mp4',{type:'video/mp4'});
+            rec.file=pf; // 持久化引用（saveNow 落库 'proxy:'+sid）
             Engine.videoDecoder.probe(pf).then(function(meta){
               if(!meta||!meta.sourceId){done=true;reject(new Error('代理注册失败'));return;}
               rec.proxySid=meta.sourceId;rec.active=true;rec.done=true;rec.progress=1;
@@ -6038,9 +6064,49 @@ function openShortcutsModal(){
 /* ---------- 项目管理器：列表/打开/重命名/副本/删除/导入/导出 ---------- */
 function openProjectsModal(){
   openModal('项目管理','<div id="pmLoading" class="ai-status">读取项目列表…</div><div class="pm-list" id="pmList"></div>'
+    +'<div style="margin-top:14px"><div class="sk-title">云 端（登录账号）</div><div id="pmCloud" class="pm-list"><div class="ai-status">检查云端…</div></div></div>'
     +'<div class="m-actions"><button class="btn" id="pmImport">导入工程 JSON</button><button class="btn" id="pmExport">导出当前工程</button>'
     +'<button class="btn" id="pmNew">新建项目</button><button class="btn primary" id="pmClose">关闭</button></div>',true);
   var listEl=$id('pmList');
+  // 云端分区：登录用户列出全部云端工程（多设备/多工程）
+  (function(){
+    var box=$id('pmCloud');
+    fetch(API_BASE+'/api/cloud/projects',{headers:{'X-User-Token':PayClient.token()},signal:AbortSignal.timeout(6000)})
+      .then(function(r){return r.ok?r.json():{projects:[]};})
+      .then(function(j){
+        box.innerHTML='';
+        var items=(j.projects||[]);
+        if(!items.length){box.appendChild(el('div','ai-status','云端暂无工程（登录后保存即自动上云）'));return;}
+        items.forEach(function(it){
+          var row=el('div','pm-item');
+          row.innerHTML='<div class="pm-icon">'+icon('layers',15)+'</div>'
+            +'<div class="pm-meta"><div class="pm-name">'+esc(it.name)+'</div>'
+            +'<div class="pm-sub">云端 · '+new Date(it.updatedAt||Date.now()).toLocaleString()+' · '+it.clipCount+' 个片段 · '+it.key+'</div></div>'
+            +'<div class="pm-ops"><button class="thb" data-op="open" title="打开">'+icon('play',13)+'</button>'
+            +'<button class="thb" data-op="del" title="删除">'+icon('trash',13)+'</button></div>';
+          row.addEventListener('click',function(e){
+            var op=(e.target.closest('.thb')||{}).dataset ? (e.target.closest('.thb')?e.target.closest('.thb').dataset.op:null) : null;
+            if(op==='del'){
+              if(!confirm('删除云端工程「'+it.name+'」？'))return;
+              fetch(API_BASE+'/api/cloud/project/'+encodeURIComponent(it.key),{method:'DELETE',headers:{'X-User-Token':PayClient.token()}})
+                .then(function(){openProjectsModal();});
+              return;
+            }
+            if(op==='open'||!op){
+              ProjectStore.saveNow().then(function(){
+                return fetch(API_BASE+'/api/cloud/project?key='+encodeURIComponent(it.key),{headers:{'X-User-Token':PayClient.token()}})
+                  .then(function(r2){if(!r2.ok)throw new Error('云端读取失败');return r2.json();})
+                  .then(function(rec){
+                    return ProjectStore.applyRecord(rec,function(sid){return ProjectStore.get('media',sid);})
+                      .then(function(){closeModal();toast('已从云端打开：'+it.name);});
+                  });
+              }).catch(function(err2){toast('打开失败：'+((err2&&err2.message)||err2));});
+            }
+          });
+          box.appendChild(row);
+        });
+      }).catch(function(){box.innerHTML='<div class="ai-status">云端不可达（未登录或离线）</div>';});
+  })();
   function render(){
     ProjectStore.listProjects().then(function(items){
       listEl.innerHTML='';
@@ -7801,7 +7867,7 @@ function init(){
     EffectPipe:EffectPipe,setClipProp:setClipProp,App:App,resolveClipParams:resolveClipParams,ImageStore:ImageStore,drawExportFrame:drawExportFrame,renderAudioWindow:renderAudioWindow,
     ProxyStore:ProxyStore,generateProxyFor:generateProxyFor,
     opLog:function(){return _dcore?_dcore.opLog.slice():[];},
-    version:'1.1.0'};
+    version:'1.2.0'};
 }
 
 init();

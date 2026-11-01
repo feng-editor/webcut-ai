@@ -926,8 +926,9 @@ def cloud_status():
     u = _auth_user()
     if u:  # 登录用户：云端工程存 SQLite（按 user_id 隔离）
         con = _db()
+        pkey = (request.args.get('key') or 'main')
         row = con.execute('SELECT name,data,updated_at FROM cloud_projects WHERE user_id=? AND project_key=?',
-                          (u['id'], 'main')).fetchone()
+                          (u['id'], pkey)).fetchone()
         con.close()
         if not row:
             return jsonify({'exists': False})
@@ -948,14 +949,50 @@ def cloud_status():
         return jsonify({'exists': False})
 
 
+@app.route('/api/cloud/projects', methods=['GET'])
+def cloud_projects_list():
+    u = _auth_user()
+    if not u:
+        return jsonify({'error': '未登录'}), 401
+    con = _db()
+    rows = con.execute('SELECT project_key,name,updated_at,data FROM cloud_projects WHERE user_id=? ORDER BY updated_at DESC',
+                       (u['id'],)).fetchall()
+    con.close()
+    items = []
+    for r2 in rows:
+        clip_n = 0
+        try:
+            clip_n = len((json.loads(r2[3]) or {}).get('clips', []))
+        except Exception:
+            pass
+        items.append({'key': r2[0], 'name': r2[1] or '未命名项目', 'updatedAt': r2[2], 'clipCount': clip_n})
+    return jsonify({'projects': items})
+
+
+@app.route('/api/cloud/project/<pkey>', methods=['DELETE'])
+def cloud_project_delete(pkey):
+    u = _auth_user()
+    if not u:
+        return jsonify({'error': '未登录'}), 401
+    if '/' in pkey or '\\' in pkey or len(pkey) > 64:
+        return jsonify({'error': '非法 key'}), 400
+    con = _db()
+    con.execute('DELETE FROM cloud_projects WHERE user_id=? AND project_key=?', (u['id'], pkey))
+    con.commit(); con.close()
+    return jsonify({'ok': True})
+
+
 @app.route('/api/cloud/project', methods=['GET', 'PUT'])
 def cloud_project_user_aware():
     u = _auth_user()
     if u:
         con = _db()
+        pkey = (request.args.get('key') or 'main')
+        if '/' in pkey or '\\' in pkey or len(pkey) > 64:
+            return jsonify({'error': '非法 key'}), 400
         if request.method == 'GET':
             row = con.execute('SELECT data FROM cloud_projects WHERE user_id=? AND project_key=?',
-                              (u['id'], 'main')).fetchone()
+                              (u['id'], pkey)).fetchone()
             con.close()
             if not row:
                 return jsonify({'error': '云端暂无备份'}), 404
@@ -965,7 +1002,7 @@ def cloud_project_user_aware():
         rec = json.loads(raw.decode('utf-8'))
         con.execute('INSERT INTO cloud_projects(user_id,project_key,name,data,updated_at) VALUES(?,?,?,?,?) '
                     'ON CONFLICT(user_id,project_key) DO UPDATE SET name=excluded.name,data=excluded.data,updated_at=excluded.updated_at',
-                    (u['id'], 'main', rec.get('name'), raw.decode('utf-8'), time.time()))
+                    (u['id'], pkey, rec.get('name'), raw.decode('utf-8'), time.time()))
         con.commit(); con.close()
         print(f'[cloud] 用户工程已保存 ({len(raw)//1024}KB)', flush=True)
         return jsonify({'ok': True})
