@@ -2466,6 +2466,9 @@ var ProjectStore=(function(){
         });
       });
       chain.then(function(){
+        // 健壮性：无效记录（无 tracks）安全失败，绝不悬挂调用方
+        if(!rec.tracks||!Array.isArray(rec.tracks)){console.warn('[WebCut] 云端记录无效（缺 tracks）');resolve(false);return;}
+        try{
         State.tracks=rec.tracks;
         State.clips=rec.clips.filter(function(c){return !c.sourceId||map[c.sourceId];})
           .map(function(c){if(c.sourceId)c.sourceId=map[c.sourceId];c.props=normalizeProps(c.props);return c;});
@@ -2507,6 +2510,7 @@ var ProjectStore=(function(){
         toast('已恢复工程（'+State.clips.length+' 个片段）');
         ensurePlayheadFrames(false);
         resolve(true);
+        }catch(e2){console.warn('[WebCut] 工程恢复失败：',e2&&e2.message);resolve(false);}
       });
     });
   }
@@ -2526,7 +2530,7 @@ var ProjectStore=(function(){
   var onSaveCb=null;
   return {saveNow:saveNow,schedule:schedule,restore:restore,wipe:wipe,
     listProjects:listProjects,loadProject:loadProject,renameProject:renameProject,deleteProject:deleteProject,
-    currentPid:currentPid,getKV:function(store,key){return get(store,key);},
+    currentPid:currentPid,getKV:function(store,key){return get(store,key);},clearStore:function(store){return clear(store);},
     exportJSON:function(){
       return get(KV,'project:'+currentPid()).then(function(rec){
         if(!rec)throw new Error('当前没有已保存的工程');
@@ -6097,8 +6101,9 @@ function openProjectsModal(){
                 return fetch(API_BASE+'/api/cloud/project?key='+encodeURIComponent(it.key),{headers:{'X-User-Token':PayClient.token()}})
                   .then(function(r2){if(!r2.ok)throw new Error('云端读取失败');return r2.json();})
                   .then(function(rec){
-                    return ProjectStore.applyRecord(rec,function(sid){return ProjectStore.get('media',sid);})
-                      .then(function(){closeModal();toast('已从云端打开：'+it.name);});
+                    // 跨设备：本地缺失的媒体自动从云端拉回（同一拉取器与个人中心恢复一致）
+                    return ProjectStore.applyRecord(rec,CloudSync.getMediaFromCloud(rec))
+                      .then(function(){closeModal();toast('已从云端打开：'+it.name+'（媒体已同步）');});
                   });
               }).catch(function(err2){toast('打开失败：'+((err2&&err2.message)||err2));});
             }
@@ -7867,7 +7872,7 @@ function init(){
     EffectPipe:EffectPipe,setClipProp:setClipProp,App:App,resolveClipParams:resolveClipParams,ImageStore:ImageStore,drawExportFrame:drawExportFrame,renderAudioWindow:renderAudioWindow,
     ProxyStore:ProxyStore,generateProxyFor:generateProxyFor,
     opLog:function(){return _dcore?_dcore.opLog.slice():[];},
-    version:'1.2.0'};
+    version:'1.3.0'};
 }
 
 init();

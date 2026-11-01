@@ -1045,7 +1045,13 @@ def cloud_media(sid, sub=None):
     if '/' in sid or '\\' in sid or sid.startswith('.'):
         return jsonify({'error': '非法 ID'}), 400
 
-    root = os.path.join(CLOUD_DIR, hashlib.sha256(token.encode()).hexdigest()[:32], 'media')
+    # 登录用户：媒体存 user_id 稳定目录（跨会话/跨设备一致）；匿名走 token 哈希目录
+    u = _auth_user()
+    if u:
+        root = os.path.join(CLOUD_DIR, 'u' + str(u['id']), 'media')
+    else:
+        root = os.path.join(CLOUD_DIR, hashlib.sha256(token.encode()).hexdigest()[:32], 'media')
+    legacy_root = os.path.join(CLOUD_DIR, hashlib.sha256(token.encode()).hexdigest()[:32], 'media')
     suffix = '.audio.wav' if sub == 'audio' else '.bin'
     fpath = os.path.join(root, sid + suffix)
 
@@ -1068,6 +1074,11 @@ def cloud_media(sid, sub=None):
         try:
             return send_file(fpath)
         except Exception:
+            if u:
+                try:  # 登录用户：uid 目录缺失时回落旧哈希目录（历史数据透明兼容）
+                    return send_file(os.path.join(legacy_root, sid + suffix))
+                except Exception:
+                    pass
             return jsonify({'error': '媒体不存在'}), 404
 
 
@@ -1076,23 +1087,36 @@ def cloud_usage():
     token = request.headers.get('X-User-Token', '')
     if not token:
         return jsonify({'error': '缺少 Token'}), 401
-    root = os.path.join(CLOUD_DIR, hashlib.sha256(token.encode()).hexdigest()[:32])
+    u = _auth_user()
+    hash_root = os.path.join(CLOUD_DIR, hashlib.sha256(token.encode()).hexdigest()[:32])
     used = 0
-    for dirpath, _dirs, files in os.walk(root):
-        for fn in files:
-            if not fn.endswith('.tmp'):
+    # 登录用户：统计 uid 目录 + 旧哈希目录（历史数据）；匿名：哈希目录
+    roots = [os.path.join(CLOUD_DIR, 'u' + str(u['id'])), hash_root] if u else [hash_root]
+    seen = set()
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            for fn in files:
+                if fn.endswith('.tmp'):
+                    continue
+                fp = os.path.join(dirpath, fn)
+                if fp in seen:
+                    continue
+                seen.add(fp)
                 try:
-                    used += os.path.getsize(os.path.join(dirpath, fn))
+                    used += os.path.getsize(fp)
                 except Exception:
                     pass
     out = {'used': used, 'quota': 2 * 1024 * 1024 * 1024}
-    u = _auth_user()
     if u:
         con = _db()
         row = con.execute('SELECT data FROM cloud_projects WHERE user_id=? AND project_key=?',
                           (u['id'], 'main')).fetchone()
         con.close()
-        out['used'] = len(row[0].encode('utf-8')) if row else 0
+        if row:
+            try:
+                out['used'] = max(used, len(row[0].encode('utf-8')))
+            except Exception:
+                pass
         out['plan'] = _user_plan(u)
         out['aiCredits'] = u['ai_credits']
         out['email'] = u['email']

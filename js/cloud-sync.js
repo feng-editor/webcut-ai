@@ -147,6 +147,25 @@ window.WebCutCloud=function(deps){
         .then(function(r){return r.json();}).catch(function(){return null;});
     });
   }
+  /* 云端工程的媒体拉取器：返回 applyRecord 兼容的 getMedia(sid)（本地缺失时从云端下载） */
+  function getMediaFromCloud(rec){
+    var meta=(rec.mediaMeta||{});
+    return function(sid){
+      var m2=meta[sid]||{};
+      return fetch(API_BASE + '/api/cloud/media/'+sid,{headers:hdrs(),signal:AbortSignal.timeout(600000)})
+        .then(function(r){return r.ok?r.blob():null;})
+        .then(function(blob){
+          if(!blob)return null;
+          var m={blob:blob,name:m2.name,mime:m2.mime};
+          if(m2.audio){ // 视频源的 AI 附加音轨
+            return fetch(API_BASE + '/api/cloud/media/'+sid+'/audio',{headers:hdrs(),signal:AbortSignal.timeout(120000)})
+              .then(function(r2){return r2.ok?r2.blob():null;})
+              .then(function(wav){if(wav)m.audioWav=wav;return m;});
+          }
+          return m;
+        }).catch(function(){return null;});
+    };
+  }
   function pull(){
     return available().then(function(ok){
       if(!ok)return false;
@@ -157,21 +176,7 @@ window.WebCutCloud=function(deps){
           return r.json();
         })
         .then(function(rec){
-          return ProjectStore.applyRecord(rec,function(sid){
-            var meta=(rec.mediaMeta||{})[sid]||{};
-            return fetch(API_BASE + '/api/cloud/media/'+sid,{headers:hdrs(),signal:AbortSignal.timeout(600000)})
-              .then(function(r){return r.ok?r.blob():null;})
-              .then(function(blob){
-                if(!blob)return null;
-                var m={blob:blob,name:meta.name,mime:meta.mime};
-                if(meta.audio){ // 视频源的 AI 附加音轨
-                  return fetch(API_BASE + '/api/cloud/media/'+sid+'/audio',{headers:hdrs(),signal:AbortSignal.timeout(120000)})
-                    .then(function(r2){return r2.ok?r2.blob():null;})
-                    .then(function(wav){if(wav)m.audioWav=wav;return m;});
-                }
-                return m;
-              }).catch(function(){return null;});
-          }).then(function(applied){
+          return ProjectStore.applyRecord(rec,getMediaFromCloud(rec)).then(function(applied){
             if(applied){
               cloudSaved={};
               Object.keys(rec.mediaMeta||{}).forEach(function(s){cloudSaved[s]=1;}); // 云端已有，不再上传
@@ -182,6 +187,6 @@ window.WebCutCloud=function(deps){
         });
     }).catch(function(e){toast('云端恢复失败：'+((e&&e.message)||e));return false;});
   }
-  return {push:push,status:status,usage:usage,pull:pull};
+  return {push:push,status:status,usage:usage,pull:pull,getMediaFromCloud:function(rec){return getMediaFromCloud(rec);}};
 };
 })();
