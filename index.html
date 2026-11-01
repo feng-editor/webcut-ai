@@ -1514,6 +1514,52 @@ var VideoDecoderService=(function(){
    精确排入 AudioContext 时钟；seek 时重排；音量/静音走主增益。
    ============================================================ */
 /* ============================================================
+   AudioFX —— 音频滤镜：3 段 EQ + 混响 + 基础降噪（播放与导出共用节点构建）
+   props: eqLow/eqMid/eqHigh (-12..12 dB), reverb ('none'|'room'|'hall'|'cave'), denoise (bool)
+   ============================================================ */
+var AudioFX=(function(){
+  function has(p){return (p.eqLow&&p.eqLow!==0)||(p.eqMid&&p.eqMid!==0)||(p.eqHigh&&p.eqHigh!==0)||(p.reverb&&p.reverb!=='none')||p.denoise;}
+  function makeIR(ctx,seconds,decay){
+    var sr=ctx.sampleRate,len=Math.max(1,Math.floor(sr*seconds));
+    var ir=ctx.createBuffer(2,len,sr);
+    for(var ch=0;ch<2;ch++){
+      var d=ir.getChannelData(ch);
+      for(var i=0;i<len;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/len,decay);
+    }
+    return ir;
+  }
+  var REVERB_PRESETS={'room':{dur:0.6,decay:3},'hall':{dur:1.8,decay:2.2},'cave':{dur:3.2,decay:1.5}};
+  function buildChain(ctx,p){
+    if(!has(p))return null;
+    var nodes=[];
+    if(p.denoise){
+      var hp=ctx.createBiquadFilter();hp.type='highpass';hp.frequency.value=80;hp.Q.value=0.7;nodes.push(hp);
+      var lp=ctx.createBiquadFilter();lp.type='lowpass';lp.frequency.value=12000;lp.Q.value=0.7;nodes.push(lp);
+    }
+    if(p.eqLow||p.eqMid||p.eqHigh){
+      var lo=ctx.createBiquadFilter();lo.type='lowshelf';lo.frequency.value=250;lo.gain.value=clamp(p.eqLow||0,-12,12);nodes.push(lo);
+      var mid=ctx.createBiquadFilter();mid.type='peaking';mid.frequency.value=1200;mid.Q.value=1;mid.gain.value=clamp(p.eqMid||0,-12,12);nodes.push(mid);
+      var hi=ctx.createBiquadFilter();hi.type='highshelf';hi.frequency.value=4800;hi.gain.value=clamp(p.eqHigh||0,-12,12);nodes.push(hi);
+    }
+    if(p.reverb&&p.reverb!=='none'&&REVERB_PRESETS[p.reverb]){
+      var pre=REVERB_PRESETS[p.reverb];
+      var conv=ctx.createConvolver();conv.buffer=makeIR(ctx,pre.dur,pre.decay);
+      var last=nodes.length?nodes[nodes.length-1]:null;
+      var dry=ctx.createGain();dry.gain.value=0.75;
+      var wetG=ctx.createGain();wetG.gain.value=0.3;
+      if(last){last.connect(dry);last.connect(conv);}
+      conv.connect(wetG);
+      var merge=ctx.createGain();
+      dry.connect(merge);wetG.connect(merge);
+      for(var i=0;i<nodes.length-1;i++)nodes[i].connect(nodes[i+1]);
+      return {input:nodes[0]||merge,output:merge};
+    }
+    for(var i=0;i<nodes.length-1;i++)nodes[i].connect(nodes[i+1]);
+    return {input:nodes[0],output:nodes[nodes.length-1]};
+  }
+  return {has:has,buildChain:buildChain};
+})();
+/* ============================================================
    AudioEnvelope —— 片段音量包络（props.env: [{t:0..1 时间线相对, v:0..2 增益}])
    播放（GainNode 自动化）与导出（离线渲染折点）共用同一取值实现
    ============================================================ */
@@ -1593,7 +1639,8 @@ var AudioPlayback=(function(){
     var node=c.createBufferSource();
     node.buffer=buf;
     node.playbackRate.value=sp;
-    // 每节点增益包络：微淡入 + 淡出（片段自身 fadeOut 优先且更长），消除音频首尾的突发截断感
+    var fx=AudioFX.buildChain(c,clip.props||{});
+    if(fx){node.connect(fx.input);var fxOut=fx.output;}else var fxOut=node;
     var g=c.createGain();
     var fi=Math.min(0.06,span*0.5);
     var fo=Math.min(Math.max(0.25,clip.props.fadeOut||0),span*0.5);
@@ -1603,7 +1650,7 @@ var AudioPlayback=(function(){
     g.gain.setValueAtTime(1,t0+span-fo);
     g.gain.linearRampToValueAtTime(0.0001,t0+span);
     AudioEnvelope.applyTo(g,c,t0,offset,span); // 音量包络
-    node.connect(g);g.connect(gain);
+    fxOut.connect(g);g.connect(gain);
     try{node.start(t0,p,span*sp);}catch(e){return;}
     active.push(node);
   }
@@ -2698,7 +2745,9 @@ function defaultProps(){
     blur:0,sharpen:0,
     ckEnabled:false,ckColor:'#00d152',ckSimilarity:30,ckSmoothness:20,
     mask:'none',maskFeather:50,maskInvert:false,maskPoints:null,
-    volume:100,fadeIn:0,fadeOut:0,voice:'none'};
+    volume:100,fadeIn:0,fadeOut:0,voice:'none',
+    animIn:'none',animOut:'none',animLoop:'none',
+    eqLow:0,eqMid:0,eqHigh:0,reverb:'none',denoise:false};
 }
 /* 旧工程/粘贴片段的 props 归一化：补齐缺失键（前进兼容） */
 function normalizeProps(p){
@@ -3381,22 +3430,103 @@ function drawLayerStack(ctx,t,W,H,pxScale,ckMaxW){
           if(xe<=c.start+0.01&&(!prev||xe>prev.start+prev.duration))prev=x;
         });
       }
-      if((tr.type==='fade'||tr.type==='slide')&&prev){
-        // 出片：冻结其最后一帧垫底（叠化被覆盖 / 滑动露出）
+      var prev=null;
+      if(tr.type!=='dip'){
+        // 除黑场外都取前片垫底（推近/拉远/旋转/擦除/百叶窗/故障/叠化/滑动）
+        State.clips.forEach(function(x){
+          if(x.trackId!==c.trackId||x.id===c.id)return;
+          var xe=x.start+x.duration;
+          if(xe<=c.start+0.01&&(!prev||xe>prev.start+prev.duration))prev=x;
+        });
+      }
+      var drawPrev=function(){
+        if(!prev)return false;
         var pe=Math.max(0,prev.start+prev.duration-0.033);
         var psrc=visualFrame(prev.sourceId,clamp((prev.srcIn||0)+(pe-prev.start)*(prev.speed||1),0,Math.max(0.033,(prev.srcDuration||1)-0.033)));
-        if(psrc){
-          var peff=resolveClipParams(prev,prev.duration-0.033);
-          EffectPipe.drawFrame(ctx,psrc,peff,W,H,{clipId:prev.id,pxScale:pxScale,ckMaxW:ckMaxW,alpha:1});
-        }
+        if(!psrc)return false;
+        var peff=resolveClipParams(prev,prev.duration-0.033);
+        EffectPipe.drawFrame(ctx,psrc,peff,W,H,{clipId:prev.id,pxScale:pxScale,ckMaxW:ckMaxW,alpha:1});
+        return true;
+      };
+      // —— 各转场类型真实混合渲染 ——
+      if(tr.type==='slide'&&prev){
+        drawPrev();
         ctx.save();
-        if(tr.type==='slide')ctx.translate((1-p)*W,0);
+        ctx.translate((1-p)*W,0);
+        var eff=resolveClipParams(c,t-c.start);
+        EffectPipe.drawFrame(ctx,e,eff,W,H,{clipId:c.id,pxScale:pxScale,ckMaxW:ckMaxW,alpha:1});
+        ctx.restore();
+        return;
+      }
+      if((tr.type==='pushIn'||tr.type==='pullOut'||tr.type==='rotate')&&prev){
+        drawPrev();
+        ctx.save();
+        // 外层围绕中心变换（drawFrame 内部变换会叠加在外层之上）
+        ctx.translate(W/2,H/2);
+        if(tr.type==='pushIn'){var sc=1+(1-p)*0.35;ctx.scale(sc,sc);}
+        else if(tr.type==='pullOut'){var sc2=0.65+p*0.35;ctx.scale(sc2,sc2);}
+        else if(tr.type==='rotate'){ctx.rotate((1-p)*Math.PI/2);}
+        ctx.translate(-W/2,-H/2);
+        var effR=resolveClipParams(c,t-c.start);
+        EffectPipe.drawFrame(ctx,e,effR,W,H,{clipId:c.id,pxScale:pxScale,ckMaxW:ckMaxW,alpha:1});
+        ctx.restore();
+        return;
+      }
+      if(tr.type==='wipe'&&prev){
+        drawPrev();
+        ctx.save();
+        ctx.beginPath();ctx.rect(0,0,W*p,H);ctx.clip(); // 擦除：入片从左向右展开
+        var effW=resolveClipParams(c,t-c.start);
+        EffectPipe.drawFrame(ctx,e,effW,W,H,{clipId:c.id,pxScale:pxScale,ckMaxW:ckMaxW,alpha:1});
+        ctx.restore();
+        return;
+      }
+      if(tr.type==='blinds'&&prev){
+        drawPrev();
+        ctx.save();
+        var bands=6,bh=H/bands;
+        for(var bi=0;bi<bands;bi++){
+          var bp=clamp(p*bands-(bands-1-bi),0,1); // 各带依次展开
+          ctx.beginPath();ctx.rect(0,bi*bh,W*bp,bh+1);ctx.clip();
+          var effB=resolveClipParams(c,t-c.start);
+          EffectPipe.drawFrame(ctx,e,effB,W,H,{clipId:c.id,pxScale:pxScale,ckMaxW:ckMaxW,alpha:1});
+        }
+        ctx.restore();
+        return;
+      }
+      if(tr.type==='glitch'&&prev){
+        drawPrev();
+        // 故障：RGB 通道错位 + 水平切片抖动 + 透明度闪烁
+        ctx.save();
+        ctx.globalCompositeOperation='lighter';
+        var offR=(1-p)*W*0.03,offB=-(1-p)*W*0.03;
+        var effG=resolveClipParams(c,t-c.start);
+        ctx.globalAlpha=0.45;
+        ctx.translate(offR,0);EffectPipe.drawFrame(ctx,e,effG,W,H,{clipId:c.id,pxScale:pxScale,ckMaxW:ckMaxW,alpha:0.5});
+        ctx.translate(-offR*2,offB*0.2);EffectPipe.drawFrame(ctx,e,effG,W,H,{clipId:c.id,pxScale:pxScale,ckMaxW:ckMaxW,alpha:0.5});
+        ctx.restore();
+        // 水平切片抖动（3 条横带随机偏移，幅度随 p 衰减）
+        var bands2=3,amp=(1-p)*W*0.05;
+        for(var gi=0;gi<bands2;gi++){
+          var gy=H*gi/bands2,gh=H/bands2;
+          var gx=(Math.sin(t*57+gi*7)*amp);
+          ctx.save();
+          ctx.beginPath();ctx.rect(0,gy,W,gh);ctx.clip();
+          ctx.translate(gx,0);
+          EffectPipe.drawFrame(ctx,e,effG,W,H,{clipId:c.id,pxScale:pxScale,ckMaxW:ckMaxW,alpha:0.85});
+          ctx.restore();
+        }
+        return;
+      }
+      if((tr.type==='fade'||tr.type==='slide')&&prev){
+        drawPrev();
+        ctx.save();
         var eff=resolveClipParams(c,t-c.start);
         EffectPipe.drawFrame(ctx,e,eff,W,H,{clipId:c.id,pxScale:pxScale,ckMaxW:ckMaxW,alpha:p});
         ctx.restore();
         return;
       }
-      // dip（或无前片的叠化）：从黑渐入
+      // dip（或无前片的其余类型）：从黑渐入
       var eff2=resolveClipParams(c,t-c.start);
       EffectPipe.drawFrame(ctx,e,eff2,W,H,{clipId:c.id,pxScale:pxScale,ckMaxW:ckMaxW,alpha:p});
       return;
@@ -3418,6 +3548,37 @@ function textAt(t){
   }
   return null;
 }
+/* 文字动画：入场/出场/循环（p: 片段内进度 0-1，返回 {dx,dy,scale,alpha,chars}） */
+function textAnimApply(p, txt, animIn, animOut, animLoop){
+  var o={dx:0,dy:0,scale:1,alpha:1,chars:null};
+  var IN_DUR=0.6, OUT_DUR=0.5;
+  if(animIn&&animIn!=='none'&&p*1<IN_DUR&&IN_DUR<1){
+    var ip=clamp(p/IN_DUR,0,1);
+    if(animIn==='typewriter'){
+      var n=Math.max(1,Math.floor(txt.length*ip));
+      o.chars=txt.slice(0,n);
+      o.alpha=ip<0.15?ip/0.15:1;
+    }else if(animIn==='pop'){ // easeOutBack 弹入
+      var s=1.70158,ip2=ip-1;o.scale=1+(ip2*ip2*((s+1)*ip2+s)+1)*0.6;
+    }else if(animIn==='fadeUp'){o.alpha=ip;o.dy=(1-ip)*40;}
+    else if(animIn==='slideIn'){o.dx=(1-(1-Math.pow(1-ip,3)))*W3();}
+    else if(animIn==='wipe'){o.chars=txt.slice(0,Math.floor(txt.length*ip));}
+    else if(animIn==='zoomBlur'){o.scale=1.6-ip*0.6;o.alpha=ip;}
+  }
+  if(animOut&&animOut!=='none'&&(1-p)*1<OUT_DUR&&OUT_DUR<1){
+    var op=clamp((1-p)/OUT_DUR,0,1);
+    if(animOut==='fadeOut'){o.alpha*=op;}
+    else if(animOut==='shrinkOut'){o.scale*=0.5+op*0.5;o.alpha*=op;}
+    else if(animOut==='fadeUpOut'){o.alpha*=op;o.dy-=(1-op)*30;}
+  }
+  if(animLoop&&animLoop!=='none'){
+    if(animLoop==='blink'){o.alpha*=0.6+0.4*Math.sin(p*40);}
+    else if(animLoop==='pulse'){var pu=1+0.04*Math.sin(p*25);o.scale*=pu;}
+    else if(animLoop==='float'){o.dy+=Math.sin(p*20)*8;}
+  }
+  return o;
+}
+function W3(){return 1;}
 function drawTextLayers(ctx,t,W,H){
   for(var i=0;i<State.tracks.length;i++){
     var tr=State.tracks[i];
@@ -3426,14 +3587,21 @@ function drawTextLayers(ctx,t,W,H){
       var c=State.clips[j];
       if(c.trackId!==tr.id||!(t>=c.start&&t<c.start+c.duration))continue;
       var p=c.props||{};
+      var prog=(t-c.start)/Math.max(0.01,c.duration); // 片段内进度 0-1
       var txt=p.text||c.label;
       var style=p.textStyle||'clean';
       var fs=p.fontSize||Math.round(H/13);
+      if(p.fontSize&&p.fontSize<1)fs=Math.round(p.fontSize*H); // 标题模板：比例 → 像素
+      var anim=textAnimApply(prog,txt,p.animIn,p.animOut,p.animLoop);
+      if(anim.chars!==null)txt=anim.chars;
+      if(!txt)continue;
       ctx.save();
-      ctx.globalAlpha=clamp((p.opacity!=null?p.opacity:100)/100,0,1);
-      ctx.translate(W/2+clamp(p.x||0,-100,100)/100*(W/2),H-H*0.12+clamp(p.y||0,-100,100)/100*(H/2));
+      ctx.globalAlpha=clamp((p.opacity!=null?p.opacity:100)/100,0,1)*anim.alpha;
+      ctx.translate(W/2+clamp(p.x||0,-100,100)/100*(W/2)+anim.dx*(W/200),
+                    H-H*0.12+clamp(p.y||0,-100,100)/100*(H/2)+anim.dy*(H/200));
       if(p.rotation)ctx.rotate(p.rotation*Math.PI/180);
-      if((p.scale||100)!==100)ctx.scale(p.scale/100,p.scale/100);
+      var sc2=(p.scale||100)/100*anim.scale;
+      if(sc2!==1)ctx.scale(sc2,sc2);
       ctx.font=(style==='pop'?'800 ':'600 ')+fs+'px system-ui, "PingFang SC", sans-serif';
       ctx.textAlign='center';ctx.textBaseline='middle';
       if(style==='bar'){
@@ -4088,6 +4256,17 @@ var TEXT_TPLS=[
   ['pop','tpl-pop','综艺花字'],
   ['bar','tpl-bar','底部字幕条']
 ];
+/* 标题模板库 ≥8 套：一键应用字体/字号/颜色/描边/动画组合 */
+var TITLE_TEMPLATES=[
+  {name:'新闻标题', tpl:'bar', fontSize:0.055, textColor:'#ffffff', strokeWidth:0, animIn:'fadeUp', animOut:'fadeOut', animLoop:'none'},
+  {name:'综艺大字', tpl:'pop', fontSize:0.085, textColor:'#ffffff', strokeWidth:0, animIn:'pop', animOut:'shrinkOut', animLoop:'none'},
+  {name:'打字机报道', tpl:'clean', fontSize:0.05, textColor:'#e8eaee', strokeWidth:0, animIn:'typewriter', animOut:'fadeOut', animLoop:'none'},
+  {name:'霓虹闪烁', tpl:'clean', fontSize:0.07, textColor:'#6db2ff', strokeWidth:0, animIn:'zoomBlur', animOut:'fadeOut', animLoop:'blink'},
+  {name:'纪录片字幕', tpl:'bar', fontSize:0.045, textColor:'#e8eaee', strokeWidth:0, animIn:'fadeUp', animOut:'fadeUpOut', animLoop:'none'},
+  {name:'擦除快讯', tpl:'stroke', fontSize:0.06, textColor:'#ffffff', strokeWidth:2, animIn:'wipe', animOut:'shrinkOut', animLoop:'none'},
+  {name:'浮动提示', tpl:'clean', fontSize:0.05, textColor:'#ffffff', strokeWidth:1, animIn:'slideIn', animOut:'fadeOut', animLoop:'float'},
+  {name:'脉冲动感', tpl:'pop', fontSize:0.075, textColor:'#ffffff', strokeWidth:0, animIn:'pop', animOut:'shrinkOut', animLoop:'pulse'}
+];
 function renderTextPanel(box){
   var wrap=el('div','txt-box');
   wrap.appendChild(el('div','field-label','字幕文本（每行一条，依次铺入文字轨）'));
@@ -4106,6 +4285,20 @@ function renderTextPanel(box){
     row.appendChild(d);
   });
   wrap.appendChild(row);
+  // 标题模板库（≥8 套：一键应用字体/字号/颜色/描边/动画）
+  wrap.appendChild(el('div','field-label','标题模板（含动画）'));
+  var tplGrid=el('div','fx-grid');
+  TITLE_TEMPLATES.forEach(function(tp){
+    var t=el('div','fx-tile','<div class="fx-name" style="padding:6px 4px">'+tp.name+'</div>');
+    t.addEventListener('click',function(){
+      // 存到变量：铺装时应用模板属性
+      cur.titleTemplate=tp;
+      Array.prototype.forEach.call(tplGrid.children,function(x){x.classList.remove('on');});
+      t.classList.add('on');
+    });
+    tplGrid.appendChild(t);
+  });
+  wrap.appendChild(tplGrid);
   var btn=el('button','btn primary',icon('type',13)+' 添加到时间线');
   btn.style.width='100%';
   wrap.appendChild(btn);
@@ -4121,6 +4314,13 @@ function renderTextPanel(box){
     lines.forEach(function(ln,i2){
       var c=makeClip(tr.id,t0+i2*2.5,2.5,ln.slice(0,14));
       c.props.text=ln;c.props.textStyle=cur.v; // 文本内容与样式随片段存储，导出时按此渲染
+      if(cur.titleTemplate){ // 标题模板：字体/字号/颜色/描边/动画一键应用
+        var tp=cur.titleTemplate;
+        if(tp.fontSize)c.props.fontSize=Math.round(H5(tp.fontSize));
+        if(tp.textColor)c.props.textColor=tp.textColor;
+        if(tp.strokeWidth)c.props.strokeWidth=tp.strokeWidth;
+        c.props.animIn=tp.animIn;c.props.animOut=tp.animOut;c.props.animLoop=tp.animLoop;
+      }
       State.clips.push(c);
     });
     endChange();renderHeaders();requestRender();
@@ -4227,7 +4427,7 @@ function renderProps(){
     }else if(key==='transition'){
       // 转场：片段入点处与前一片段真实混合渲染（预览=导出）
       var tseg=el('div','segrow');
-      [['none','无'],['fade','叠化'],['dip','黑场'],['slide','滑动']].forEach(function(m){
+      [['none','无'],['fade','叠化'],['dip','黑场'],['slide','滑动'],['pushIn','推近'],['pullOut','拉远'],['rotate','旋转'],['wipe','擦除'],['blinds','百叶窗'],['glitch','故障']].forEach(function(m){
         var cur=(c.transIn&&c.transIn.type)||'none';
         var b=el('div','seg'+(cur===m[0]?' active':''),m[1]);
         b.addEventListener('click',function(){
@@ -4265,6 +4465,37 @@ function renderProps(){
       // 文字样式：字号 / 颜色 / 描边宽度 / 描边颜色
       mkSlider(sec.body,'字号','px',12,120,1,function(){return c.props.fontSize||48;},function(v){setClipProp(c,'fontSize',v);});
       mkSlider(sec.body,'描边宽度','px',0,10,0.5,function(){return c.props.strokeWidth||0;},function(v){setClipProp(c,'strokeWidth',v);});
+      // 文字动画：入场/出场/循环
+      var anRow=el('div','prow');
+      anRow.appendChild(el('label','','入场'));
+      var anIn=document.createElement('select');anIn.className='ctl';
+      [['none','无'],['typewriter','打字机'],['pop','弹入'],['fadeUp','淡入上移'],['slideIn','滑入'],['wipe','擦除'],['zoomBlur','缩放模糊']].forEach(function(a){
+        var o=document.createElement('option');o.value=a[0];o.textContent=a[1];anIn.appendChild(o);
+      });
+      anIn.value=c.props.animIn||'none';
+      anIn.addEventListener('change',function(){beginChange();c.props.animIn=anIn.value;endChange();});
+      anRow.appendChild(anIn);anRow.appendChild(el('span','',''));
+      sec.body.appendChild(anRow);
+      var anOutRow=el('div','prow');
+      anOutRow.appendChild(el('label','','出场'));
+      var anOut=document.createElement('select');anOut.className='ctl';
+      [['none','无'],['fadeOut','淡出'],['shrinkOut','缩小消失'],['fadeUpOut','淡出上移']].forEach(function(a){
+        var o=document.createElement('option');o.value=a[0];o.textContent=a[1];anOut.appendChild(o);
+      });
+      anOut.value=c.props.animOut||'none';
+      anOut.addEventListener('change',function(){beginChange();c.props.animOut=anOut.value;endChange();});
+      anOutRow.appendChild(anOut);anOutRow.appendChild(el('span','',''));
+      sec.body.appendChild(anOutRow);
+      var anLoopRow=el('div','prow');
+      anLoopRow.appendChild(el('label','','循环'));
+      var anLoop=document.createElement('select');anLoop.className='ctl';
+      [['none','无'],['blink','闪烁'],['pulse','脉冲'],['float','浮动']].forEach(function(a){
+        var o=document.createElement('option');o.value=a[0];o.textContent=a[1];anLoop.appendChild(o);
+      });
+      anLoop.value=c.props.animLoop||'none';
+      anLoop.addEventListener('change',function(){beginChange();c.props.animLoop=anLoop.value;endChange();});
+      anLoopRow.appendChild(anLoop);anLoopRow.appendChild(el('span','',''));
+      sec.body.appendChild(anLoopRow);
       var colRow=el('div','prow');
       colRow.appendChild(el('label','','颜色'));
       var colInp=document.createElement('input');
@@ -4332,6 +4563,26 @@ function renderProps(){
       mkSelect(sec.body,'变声',[['none','无（变声开发中）']],
         function(){return c.props.voice;},function(v){setClipProp(c,'voice',v);});
       sec.body.appendChild(el('div','sec-hint','音频变声依赖实时 DSP 变调管线，列入 v0.5 音频系统——按「不伪造功能」原则暂只提供「无」。'));
+      // 音频滤镜：3 段 EQ + 混响 + 降噪（播放 GainNode 链与导出 OfflineAudioContext 同一实现）
+      var fxSec=el('div','env-wrap');
+      fxSec.appendChild(el('div','env-label','音频滤镜'));
+      mkSlider(fxSec,'低频 EQ','dB',-12,12,1,function(){return c.props.eqLow||0;},function(v){setClipProp(c,'eqLow',v);});
+      mkSlider(fxSec,'中频 EQ','dB',-12,12,1,function(){return c.props.eqMid||0;},function(v){setClipProp(c,'eqMid',v);});
+      mkSlider(fxSec,'高频 EQ','dB',-12,12,1,function(){return c.props.eqHigh||0;},function(v){setClipProp(c,'eqHigh',v);});
+      var rvRow=el('div','prow');
+      rvRow.appendChild(el('label','','混响'));
+      var rvSel=document.createElement('select');rvSel.className='ctl';
+      [['none','无'],['room','房间'],['hall','音乐厅'],['cave','洞穴']].forEach(function(a){
+        var o=document.createElement('option');o.value=a[0];o.textContent=a[1];rvSel.appendChild(o);
+      });
+      rvSel.value=c.props.reverb||'none';
+      rvSel.addEventListener('change',function(){beginChange();setClipProp(c,'reverb',rvSel.value);endChange();});
+      rvRow.appendChild(rvSel);rvRow.appendChild(el('span','',''));
+      fxSec.appendChild(rvRow);
+      var dnLab=el('label','checkrow','<input type="checkbox"'+(c.props.denoise?' checked':'')+'> 基础降噪（去低频隆隆 / 高频嘶声）');
+      dnLab.firstChild.addEventListener('change',function(){beginChange();setClipProp(c,'denoise',dnLab.firstChild.checked);endChange();});
+      fxSec.appendChild(dnLab);
+      sec.body.appendChild(fxSec);
       // 音量包络编辑器：点击添加折点 / 拖动调整 / 双击删除；播放与导出真实生效
       var envWrap=el('div','env-wrap');
       envWrap.appendChild(el('div','env-label','音量包络（纵轴增益 0–200%）'));
@@ -5684,14 +5935,20 @@ function renderAudioWindow(w0,wlen,clips){
           var seg=Engine.videoDecoder.getAudioSegment(clip.sourceId,i);
           if(!seg)continue;
           var node=ctx.createBufferSource();
-          node.buffer=seg;node.playbackRate.value=sp;node.connect(g);
+          node.buffer=seg;node.playbackRate.value=sp;
+          var fxs=AudioFX.buildChain(ctx,clip.props||{});
+          if(fxs){node.connect(fxs.input);fxs.output.connect(g);}
+          else node.connect(g);
           try{node.start((clip.start+(q0-si)/sp)-w0,q0-s0,q1-q0);}catch(e){}
         }
       }else{
         var buf=Engine.videoDecoder.getAudioBuffer(clip.sourceId);
         if(!buf)return;
         var node2=ctx.createBufferSource();
-        node2.buffer=buf;node2.playbackRate.value=sp;node2.connect(g);
+        node2.buffer=buf;node2.playbackRate.value=sp;
+        var fxA=AudioFX.buildChain(ctx,clip.props||{});
+        if(fxA){node2.connect(fxA.input);fxA.output.connect(g);}
+        else node2.connect(g);
         try{node2.start(t0,srcP0,Math.min(srcP1-srcP0,buf.duration-srcP0));}catch(e){}
       }
     });
@@ -8358,7 +8615,7 @@ function init(){
     muxMp4FromChunks:muxMp4FromChunks,mockGenerateVideo:mockGenerateVideo,makeMockBGM:makeMockBGM,
     ops:{copy:copySelected,paste:pasteClips,duplicate:duplicateSelected,del:deleteSelected,split:splitSelected,selectAll:selectAllClips},
     EffectPipe:EffectPipe,setClipProp:setClipProp,App:App,resolveClipParams:resolveClipParams,ImageStore:ImageStore,drawExportFrame:drawExportFrame,renderAudioWindow:renderAudioWindow,
-    ProxyStore:ProxyStore,generateProxyFor:generateProxyFor,
+    ProxyStore:ProxyStore,generateProxyFor:generateProxyFor,AudioFX:AudioFX,
     opLog:function(){return _dcore?_dcore.opLog.slice():[];},
     version:'1.5.0'};
 }
