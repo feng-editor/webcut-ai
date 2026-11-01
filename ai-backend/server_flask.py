@@ -809,8 +809,13 @@ def _auth_user():
     if not token:
         return None
     con = _db()
-    row = con.execute('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?',
-                      (token,)).fetchone()
+    row = con.execute(
+        'SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id '
+        'WHERE s.token=? AND s.last_seen > ?',
+        (token, time.time() - 30 * 86400)).fetchone()
+    if row:  # 活跃会话：刷新 last_seen（滑动过期）
+        con.execute('UPDATE sessions SET last_seen=? WHERE token=?', (time.time(), token))
+        con.commit()
     con.close()
     if not row:
         return None
