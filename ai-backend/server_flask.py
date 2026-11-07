@@ -1895,7 +1895,11 @@ def serve_static(path):
         return jsonify({'error': 'not found'}), 404
     low = norm.lower()
     if any(low.endswith(ext) for ext in _STATIC_DENY_EXT):
-        return jsonify({'error': 'not found'}), 404
+        # PWA 白名单：manifest.json 是渐进式 Web 应用必需的清单文件
+        if low.endswith('/manifest.json') or low == 'manifest.json':
+            pass  # 放行
+        else:
+            return jsonify({'error': 'not found'}), 404
     fpath = os.path.abspath(os.path.join(ROOT, path))
     # 双重校验：abspath 前缀 + realpath（防符号链接逃逸）
     real_root = os.path.realpath(ROOT)

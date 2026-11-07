@@ -361,3 +361,11 @@ uid 目录跨会话读回 ✓；新设备模拟全链路（导入→云推→清
 ### 后端
 - POST /api/ai/editplan：Qwen 生成完整剪辑方案 JSON（含 hasFootage 智能区分复用/生成）
 - 限流 20 次/10min；PBKDF2 auth 鉴权
+
+## v1.7.0 PWA（手机可安装）
+- manifest.json（名称/图标/主题色/快捷方式/standalone 模式）
+- Service Worker（静态资源离线缓存，API/媒体不缓存）
+- 4 个品牌图标（192/512 + maskable 变体，纯 Python 生成）
+- 安装提示条（beforeinstallprompt → 底部引导安装到桌面）
+- 苹果设备 meta（apple-touch-icon/capable/status-bar）
+- 手机浏览器打开 → 底部出现「安装到手机桌面」→ 点击即安装 → 全屏独立运行

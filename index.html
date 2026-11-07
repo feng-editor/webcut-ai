@@ -2,7 +2,14 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0e1013">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="WebCut">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icons/icon-192.png">
+<link rel="icon" type="image/png" href="/icons/icon-192.png">
 <title>WebCut Studio — AI 视频创作平台</title>
 <style>
 /* ============================================================
@@ -8626,6 +8633,7 @@ function init(){
   // ============================================================
   // 移动端适配（≤768px）：设备检测 + 底部导航 + 底部抽屉 + 触控
   // ============================================================
+  var isPWA=window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone;
   var isMobile=window.matchMedia('(max-width: 768px)').matches;
   State.isMobile=isMobile;
 
@@ -8872,6 +8880,27 @@ function init(){
 
 init();
 window.__EDITOR__.renderPropsFn=renderProps;
+/* PWA：Service Worker 注册 + 安装提示 */
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('/sw.js').then(function(reg){
+    console.log('[PWA] Service Worker registered');
+  }).catch(function(e){ console.warn('[PWA] SW failed:', e.message); });
+}
+var _pwaPrompt=null;
+window.addEventListener('beforeinstallprompt',function(e){
+  e.preventDefault();_pwaPrompt=e;
+  // 底部安装提示条
+  var bar=document.createElement('div');
+  bar.style.cssText='position:fixed;bottom:0;left:0;right:0;z-index:999;background:var(--bg3);border-top:1px solid var(--line2);padding:10px 16px;display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text)';
+  bar.innerHTML='<span style="flex:1">📱 安装 WebCut 到手机桌面（离线可用 · 全屏体验）</span><button class="btn sm primary" id="pwaInstall">安装</button><button class="btn sm" id="pwaDismiss">✕</button>';
+  document.body.appendChild(bar);
+  document.getElementById('pwaInstall').addEventListener('click',function(){
+    if(_pwaPrompt){_pwaPrompt.prompt();_pwaPrompt.userChoice.then(function(c2){if(c2.outcome==='accepted'){bar.remove();toast('WebCut 已安装到桌面 ✓');}});}
+    else bar.remove();
+  });
+  document.getElementById('pwaDismiss').addEventListener('click',function(){bar.remove();});
+});
+window.addEventListener('appinstalled',function(){toast('WebCut 已安装 ✓');});
 })();
 </script>
 </body>
