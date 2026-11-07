@@ -1,0 +1,22 @@
+{
+  "name": "WebCut — AI 视频创作平台",
+  "short_name": "WebCut",
+  "description": "专业 AI 视频剪辑：多轨时间线、真实效果管线、AI 生成、智能字幕、4K 导出",
+  "start_url": "/?source=pwa",
+  "display": "standalone",
+  "background_color": "#0e1013",
+  "theme_color": "#0e1013",
+  "orientation": "any",
+  "categories": ["video", "productivity", "utilities"],
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icons/icon-192-maskable.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "screenshots": [],
+  "shortcuts": [
+    { "name": "AI 一键成片", "url": "/?ai=autofilm", "description": "输入主题，AI 自动生成分镜并剪辑" },
+    { "name": "AI 配音", "url": "/?ai=tts", "description": "文本转语音，自动铺入音频轨" }
+  ]
+}

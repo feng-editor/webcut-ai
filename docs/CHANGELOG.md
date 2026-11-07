@@ -369,3 +369,14 @@ uid 目录跨会话读回 ✓；新设备模拟全链路（导入→云推→清
 - 安装提示条（beforeinstallprompt → 底部引导安装到桌面）
 - 苹果设备 meta（apple-touch-icon/capable/status-bar）
 - 手机浏览器打开 → 底部出现「安装到手机桌面」→ 点击即安装 → 全屏独立运行
+
+## v1.7.0 补充：PWA 手机可安装
+
+### PWA（渐进式 Web 应用）
+- manifest.webmanifest（standalone 模式/品牌图标/快捷方式）
+- Service Worker（静态资源离线缓存，API/媒体不缓存）
+- 4 个品牌图标（192/512 + maskable 变体，纯 Python 生成无依赖）
+- 安装提示条（beforeinstallprompt → 底部引导安装到桌面）
+- 苹果设备 meta（apple-touch-icon/capable/status-bar）
+- **手机浏览器打开 → 底部「安装到手机桌面」→ 点击即安装 → 全屏独立运行**
+- 修复：manifest 被 .json 黑名单拦截 → 改用 .webmanifest 扩展名

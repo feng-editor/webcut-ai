@@ -1882,9 +1882,35 @@ _STATIC_DENY = ('ai-backend', '.git', '.zcode', 'node_modules')
 _STATIC_DENY_EXT = ('.env', '.py', '.json', '.md', '.tar.gz', '.yml', '.yaml',
                     '.toml', '.db', '.sqlite', '.log', '.bat', '.sh', '.ps1')
 
+@app.route('/manifest.json')
+def serve_manifest():
+    import json as _json
+    manifest = {
+        "name": "WebCut - AI 视频创作平台",
+        "short_name": "WebCut",
+        "start_url": "/?source=pwa",
+        "display": "standalone",
+        "background_color": "#0e1013",
+        "theme_color": "#0e1013",
+        "icons": [
+            {"src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png"}
+        ]
+    }
+    return app.response_class(_json.dumps(manifest), mimetype='application/json')
+@app.route('/sw.js')
+def serve_sw():
+    return send_file(os.path.join(ROOT, 'sw.js'), mimetype='application/javascript')
+
 @app.route('/', defaults={'path': 'index.html'})
 @app.route('/<path:path>')
 def serve_static(path):
+    # PWA manifest：在任何黑名单之前直接返回
+    if path == 'manifest.json':
+        fp = os.path.join(ROOT, 'manifest.json')
+        if os.path.isfile(fp):
+            with open(fp, encoding='utf-8') as f:
+                return app.response_class(f.read(), mimetype='application/json')
     # 路径遍历防护：拒绝 .. 、反斜杠、空字节；解析后必须在 ROOT 内
     if '..' in path or '\\' in path or '\x00' in path:
         return jsonify({'error': 'not found'}), 404
