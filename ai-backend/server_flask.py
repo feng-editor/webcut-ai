@@ -94,6 +94,7 @@ _RATE_RULES = {  # 端点前缀 → (次数, 窗口秒)
     '/api/ai/storyboard': (10, 600),  # 10 次 / 10 分钟
     '/api/auth/register': (10, 3600),  # 注册限流：10 次 / 小时
     '/api/ai/subtitle': (60, 600),     # 60 段 / 10 分钟（8s 细分段 + VAD 跳空段）
+    '/api/ai/editplan': (20, 600),     # 20 次 / 10 分钟
 }
 _rate_hits = collections.defaultdict(collections.deque)  # (ip, prefix) → [timestamps]
 _rate_lock = threading.Lock()
@@ -495,6 +496,95 @@ def ai_subtitle():
 
     except Exception as e:
         print(f'!!!! [ASR] 异常: {e} !!!!', flush=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================
+# AI 一键成片编排（Qwen → 完整剪辑方案 JSON：分镜+旁白+转场+节奏）
+# 前端拿到方案后自动执行：素材排列 + 转场 + 旁白字幕轨 + 配音生成
+# ============================================================
+@app.route('/api/ai/editplan', methods=['POST'])
+def ai_edit_plan():
+    print('>>> [EDITPLAN] 收到一键成片方案请求 <<<', flush=True)
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        brief = (data.get('brief') or '').strip()
+        has_footage = bool(data.get('hasFootage'))
+        shot_n = max(3, min(10, int(data.get('shots') or 6)))
+        if not brief:
+            return jsonify({'error': 'brief 不能为空'}), 400
+        if not KEY:
+            return jsonify({'error': '未配置 DASHSCOPE_API_KEY'}), 501
+
+        footage_hint = ''
+        if has_footage:
+            footage_hint = '\n用户已有部分视频素材——方案应优先使用现有素材（标记 useExisting:true），不足部分才需要 AI 生成（useExisting:false）。'
+        else:
+            footage_hint = '\n用户没有现有素材——所有镜头都需要 AI 生成（useExisting 全设 false）。'
+
+        sysmsg = (
+            '你是专业短视频导演和剪辑师。根据用户主题输出完整的自动剪辑方案，严格只输出 JSON（不要 markdown）：'
+            '{'
+            '"title":"视频标题",'
+            '"shots":[{'
+            '"dur":4,'  # 秒
+            '"desc":"画面内容简述",'
+            '"visualPrompt":"AI视频生成提示词（具体含主体/场景/运镜/光线），40字以内",'
+            '"narration":"旁白台词，15字以内",'
+            '"transition":"fade",'
+            '"useExisting":false'
+            '}],'
+            '"musicStyle":"轻快/舒缓/史诗（仅描述）",'
+            '"subtitleStyle":"bar"'
+            '}'
+            f'共 {shot_n} 个分镜，dur 3-5 秒，transition 从 fade/slide/pushIn/pullOut/rotate/wipe/blinds/glitch/dip 中选。'
+            + footage_hint
+        )
+        url = DASHSCOPE_BASE + '/api/v1/services/aigc/text-generation/generation'
+        headers = {'Authorization': 'Bearer ' + KEY, 'Content-Type': 'application/json'}
+        payload = {
+            'model': QWEN_MODEL,
+            'input': {'messages': [
+                {'role': 'system', 'content': sysmsg},
+                {'role': 'user', 'content': brief[:600]}
+            ]},
+            'parameters': {'result_format': 'message', 'max_tokens': 1200, 'temperature': 0.7}
+        }
+        resp = req_lib.post(url, headers=headers, json=payload, timeout=90)
+        if resp.status_code != 200:
+            human = _translate_upstream_error(resp.text)
+            return jsonify({'error': human or f'阿里云返回 {resp.status_code}'}), 502
+        txt = (((resp.json().get('output') or {}).get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        import re as _re2
+        mm = _re2.search(r'\{[\s\S]*\}', txt)
+        if not mm:
+            return jsonify({'error': '模型未返回 JSON：' + txt[:120]}), 502
+        try:
+            plan = json.loads(mm.group(0))
+        except Exception:
+            return jsonify({'error': 'JSON 解析失败：' + mm.group(0)[:160]}), 502
+        shots = plan.get('shots') or []
+        shots = [sh for sh in shots if isinstance(sh, dict) and sh.get('visualPrompt')]
+        if not shots:
+            return jsonify({'error': '分镜方案为空'}), 502
+        for i, sh in enumerate(shots):
+            try: sh['dur'] = max(2, min(6, float(sh.get('dur') or 4)))
+            except Exception: sh['dur'] = 4
+            sh['narration'] = (sh.get('narration') or '').strip()
+            sh['desc'] = (sh.get('desc') or '').strip()
+            sh['visualPrompt'] = (sh.get('visualPrompt') or '').strip()
+            sh['transition'] = sh.get('transition') if sh.get('transition') in ('fade','slide','pushIn','pullOut','rotate','wipe','blinds','glitch','dip') else 'fade'
+            sh['useExisting'] = bool(sh.get('useExisting'))
+            sh['index'] = i
+        print(f'>>> [EDITPLAN] 方案生成: {len(shots)} 个分镜 <<<', flush=True)
+        return jsonify({
+            'title': (plan.get('title') or 'AI 一键成片').strip()[:40],
+            'shots': shots,
+            'musicStyle': (plan.get('musicStyle') or '').strip(),
+            'subtitleStyle': (plan.get('subtitleStyle') or 'bar').strip()
+        })
+    except Exception as e:
+        print(f'!!!! [EDITPLAN] 异常: {e} !!!!', flush=True)
         return jsonify({'error': str(e)}), 500
 
 
